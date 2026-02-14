@@ -71,6 +71,7 @@ class AudioEngine:
         self.recorded_chunks: List[np.ndarray] = []
         # 기본값: 녹음 중에는 스피커로 내보내지 않고 파일에만 저장.
         self.record_output_mode = "mute_while_recording"
+        self.active_record_output_mode = self.record_output_mode
 
         self.reverb_tap_seconds = (0.013, 0.017, 0.019, 0.023)
         self.reverb_tap_gains = np.array([0.45, 0.33, 0.24, 0.18], dtype=np.float32)
@@ -125,6 +126,9 @@ class AudioEngine:
             return
         with self.lock:
             self.record_output_mode = mode
+            if not self.is_recording:
+                # 미녹음 상태에서는 다음 녹음 세션 모드도 즉시 동기화한다.
+                self.active_record_output_mode = mode
 
     # -------- 스트림 시작/중지 --------
     def _find_compatible_stream_config(self) -> Tuple[int, int]:
@@ -201,6 +205,7 @@ class AudioEngine:
             self.stream = None
             self.is_recording = False
             self.recorded_chunks = []
+            self.active_record_output_mode = self.record_output_mode
 
         if stream is not None:
             stream.stop()
@@ -230,7 +235,7 @@ class AudioEngine:
         with self.lock:
             params = copy.copy(self.params)
             recording_enabled = self.is_recording
-            record_output_mode = self.record_output_mode
+            record_output_mode = self.active_record_output_mode
         if status:
             self.last_stream_status = str(status)
 
@@ -345,9 +350,13 @@ class AudioEngine:
         with self.lock:
             return self.latest_output.copy()
 
-    def start_recording(self) -> None:
+    def start_recording(self, record_output_mode: Optional[str] = None) -> None:
         """녹음 버퍼를 초기화하고 녹음 상태를 시작"""
         with self.lock:
+            if record_output_mode in {"always", "mute_while_recording"}:
+                self.record_output_mode = record_output_mode
+            # 녹음 시작 시점의 모드를 현재 녹음 세션에 고정한다.
+            self.active_record_output_mode = self.record_output_mode
             self.recorded_chunks = []
             self.is_recording = True
 
@@ -355,6 +364,7 @@ class AudioEngine:
         """녹음을 종료하고 누적된 오디오 데이터와 샘플레이트를 반환"""
         with self.lock:
             self.is_recording = False
+            self.active_record_output_mode = self.record_output_mode
             chunks = self.recorded_chunks
             self.recorded_chunks = []
             rate = self.sample_rate
@@ -381,9 +391,12 @@ class MainWindow(QMainWindow):
             "label_input_mic": "입력 마이크",
             "label_output_speaker": "출력 스피커",
             "label_language": "언어",
+            "label_process_end_mode": "처리 종료 모드",
             "btn_refresh_devices": "장치 새로고침",
             "btn_start_processing": "처리 시작",
             "btn_stop_processing": "처리 중지",
+            "process_end_mode_auto": "처리종료 자동",
+            "process_end_mode_manual": "처리종료 수동",
             "status_stopped": "중지됨",
             "status_running_sr": "{samplerate} Hz 실행 중",
             "status_running_flag": "실행 중 ({status})",
@@ -444,9 +457,12 @@ class MainWindow(QMainWindow):
             "label_input_mic": "Input Mic",
             "label_output_speaker": "Output Speaker",
             "label_language": "Language",
+            "label_process_end_mode": "Process End Mode",
             "btn_refresh_devices": "Refresh Devices",
             "btn_start_processing": "Start Processing",
             "btn_stop_processing": "Stop Processing",
+            "process_end_mode_auto": "Auto Stop Processing",
+            "process_end_mode_manual": "Manual Stop Processing",
             "status_stopped": "Stopped",
             "status_running_sr": "Running @ {samplerate} Hz",
             "status_running_flag": "Running ({status})",
@@ -510,6 +526,7 @@ class MainWindow(QMainWindow):
         self.last_recording_path: Optional[Path] = None
         self.current_language = "ko"
         self.slider_title_labels: dict[str, QLabel] = {}
+        self.process_end_mode = "auto"
 
         self._build_ui()
         self._apply_language()
@@ -541,9 +558,20 @@ class MainWindow(QMainWindow):
 
     def _on_record_output_mode_changed(self) -> None:
         """모니터링 모드 콤보 박스 변경을 엔진 설정으로 반영."""
+        self.engine.set_record_output_mode(self._get_selected_record_output_mode())
+
+    def _on_process_end_mode_changed(self) -> None:
+        """처리 종료 모드 콤보 박스 변경을 내부 상태에 반영."""
+        mode = self.process_end_mode_combo.currentData()
+        if mode in {"auto", "manual"}:
+            self.process_end_mode = str(mode)
+
+    def _get_selected_record_output_mode(self) -> str:
+        """UI 콤보에서 현재 선택된 녹음 출력 모드를 반환."""
         mode = self.record_mode_combo.currentData()
-        if isinstance(mode, str):
-            self.engine.set_record_output_mode(mode)
+        if mode in {"always", "mute_while_recording"}:
+            return str(mode)
+        return "mute_while_recording"
 
     # -------- UI 구성 --------
     def _build_ui(self) -> None:
@@ -558,6 +586,7 @@ class MainWindow(QMainWindow):
         self.input_label = QLabel()
         self.output_label = QLabel()
         self.language_label = QLabel()
+        self.process_end_mode_label = QLabel()
         self.input_combo = QComboBox()
         self.output_combo = QComboBox()
         self.language_combo = QComboBox()
@@ -565,6 +594,14 @@ class MainWindow(QMainWindow):
         self.language_combo.addItem("English", "en")
         self.language_combo.currentIndexChanged.connect(self._on_language_changed)
         self.language_combo.setCurrentIndex(0)
+        self.process_end_mode_combo = QComboBox()
+        self.process_end_mode_combo.addItem("", "auto")
+        self.process_end_mode_combo.addItem("", "manual")
+        self.process_end_mode_combo.currentIndexChanged.connect(
+            self._on_process_end_mode_changed
+        )
+        self.process_end_mode_combo.setCurrentIndex(0)
+        self.process_end_mode = "auto"
 
         self.refresh_btn = QPushButton()
         self.refresh_btn.clicked.connect(self._load_devices)
@@ -581,6 +618,8 @@ class MainWindow(QMainWindow):
         device_layout.addWidget(self.output_combo, 1, 1)
         device_layout.addWidget(self.language_label, 2, 0)
         device_layout.addWidget(self.language_combo, 2, 1)
+        device_layout.addWidget(self.process_end_mode_label, 3, 0)
+        device_layout.addWidget(self.process_end_mode_combo, 3, 1)
         device_layout.addWidget(self.refresh_btn, 0, 2)
         device_layout.addWidget(self.start_btn, 1, 2)
         device_layout.addWidget(self.stop_btn, 1, 3)
@@ -740,7 +779,7 @@ class MainWindow(QMainWindow):
         )
         # UI 기본 선택  "녹음 중 무음"
         self.record_mode_combo.setCurrentIndex(1)
-        self.engine.set_record_output_mode("mute_while_recording")
+        self.engine.set_record_output_mode(self._get_selected_record_output_mode())
 
         self.rec_start_btn = QPushButton()
         self.rec_start_btn.clicked.connect(self._start_recording)
@@ -779,6 +818,9 @@ class MainWindow(QMainWindow):
         self.input_label.setText(self._t("label_input_mic"))
         self.output_label.setText(self._t("label_output_speaker"))
         self.language_label.setText(self._t("label_language"))
+        self.process_end_mode_label.setText(self._t("label_process_end_mode"))
+        self.process_end_mode_combo.setItemText(0, self._t("process_end_mode_auto"))
+        self.process_end_mode_combo.setItemText(1, self._t("process_end_mode_manual"))
         self.refresh_btn.setText(self._t("btn_refresh_devices"))
         self.start_btn.setText(self._t("btn_start_processing"))
         self.stop_btn.setText(self._t("btn_stop_processing"))
@@ -984,7 +1026,8 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.engine.start_recording()
+        # 재녹음 시에도 선택 모드가 누락되지 않도록 시작 시점에 모드를 재적용.
+        self.engine.start_recording(self._get_selected_record_output_mode())
         self.record_status.setText(self._t("status_recording"))
         self.rec_start_btn.setEnabled(False)
         self.rec_stop_btn.setEnabled(True)
@@ -994,9 +1037,12 @@ class MainWindow(QMainWindow):
         audio, samplerate = self.engine.stop_recording()
         self.rec_start_btn.setEnabled(True)
         self.rec_stop_btn.setEnabled(False)
+        should_auto_end = self.process_end_mode == "auto"
 
         if audio.size == 0:
             self.record_status.setText(self._t("status_no_audio_captured"))
+            if should_auto_end and self.engine.is_running():
+                self._stop_stream()
             return
 
         save_path_text = self.path_edit.text().strip()
@@ -1027,6 +1073,9 @@ class MainWindow(QMainWindow):
             self._t("status_saved", path=save_path, duration=duration)
         )
         self._plot_recorded(audio, samplerate)
+
+        if should_auto_end and self.engine.is_running():
+            self._stop_stream()
 
     def _play_recording(self) -> None:
         """저장된 녹음 파일을 선택된 출력 장치로 재생"""
