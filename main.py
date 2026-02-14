@@ -1,5 +1,7 @@
 import copy
+import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -416,18 +418,23 @@ class MainWindow(QMainWindow):
             "plot_time_label": "시간",
             "label_save_path": "저장 파일",
             "label_record_output_mode": "모니터링 모드",
+            "label_playback_position": "재생 위치",
             "btn_browse_file": "파일 선택",
             "btn_pick_folder": "폴더 선택",
             "record_output_mode_always": "실시간 출력",
             "record_output_mode_mute_while_recording": "녹음 중 무음 (재생 시 출력)",
             "btn_start_recording": "녹음 시작",
             "btn_stop_and_save": "중지 후 저장",
-            "btn_play_last": "최근 녹음 재생",
+            "btn_play_pause_play": "재생",
+            "btn_play_pause_pause": "일시정지",
+            "btn_stop_playback": "정지",
             "status_no_recording": "아직 녹음된 파일이 없습니다.",
             "status_recording": "녹음 중...",
             "status_no_audio_captured": "녹음을 중지했지만 캡처된 오디오가 없습니다.",
             "status_saved": "저장 완료: {path} ({duration:.2f}초)",
             "status_playing": "재생 중: {path}",
+            "status_playback_paused": "일시정지: {path}",
+            "status_playback_stopped": "정지(0초): {path}",
             "hint_virtual_routing": "팁: Discord/음성 녹음기 등 외부 앱은 가상 오디오 케이블 장치로 라우팅하세요.",
             "dialog_device_error": "장치 오류",
             "dialog_missing_device": "장치 선택 필요",
@@ -437,6 +444,7 @@ class MainWindow(QMainWindow):
             "dialog_save_as": "녹음 파일로 저장",
             "dialog_select_folder": "저장 폴더 선택",
             "filter_wav": "WAV 파일 (*.wav)",
+            "filter_audio_save": "오디오 파일 (*.wav *.m4a);;WAV 파일 (*.wav);;M4A 파일 (*.m4a)",
             "dialog_stream_not_running": "스트림 미실행",
             "msg_start_processing_first": "먼저 오디오 처리를 시작한 뒤 녹음을 시작하세요.",
             "dialog_save_error": "저장 오류",
@@ -447,6 +455,10 @@ class MainWindow(QMainWindow):
             "dialog_processing_active": "처리 실행 중",
             "msg_playback_while_processing_locked": "처리가 실행 중일 때는 자동으로 중지되지 않습니다. 재생하려면 먼저 처리 중지를 눌러주세요.",
             "dialog_stream_error": "오디오 스트림 오류",
+            "status_playback_done": "재생 완료: {path}",
+            "status_playback_position": "{current:.2f}초 / {total:.2f}초",
+            "msg_m4a_dep_missing": "M4A 처리를 위해 `imageio-ffmpeg` 패키지가 필요합니다.",
+            "msg_m4a_convert_failed": "M4A 변환/로딩에 실패했습니다: {reason}",
         },
         "en": {
             "window_title": "Ondanbi VE Studio",
@@ -482,18 +494,23 @@ class MainWindow(QMainWindow):
             "plot_time_label": "Time",
             "label_save_path": "Save File",
             "label_record_output_mode": "Monitor Mode",
+            "label_playback_position": "Playback Position",
             "btn_browse_file": "Browse File",
             "btn_pick_folder": "Choose Folder",
             "record_output_mode_always": "Live Monitor",
             "record_output_mode_mute_while_recording": "Mute While Recording (playback only)",
             "btn_start_recording": "Start Recording",
             "btn_stop_and_save": "Stop and Save",
-            "btn_play_last": "Play Last Recording",
+            "btn_play_pause_play": "Play",
+            "btn_play_pause_pause": "Pause",
+            "btn_stop_playback": "Stop",
             "status_no_recording": "No recording yet.",
             "status_recording": "Recording...",
             "status_no_audio_captured": "Recording stopped (no audio captured).",
             "status_saved": "Saved: {path} ({duration:.2f} sec)",
             "status_playing": "Playing: {path}",
+            "status_playback_paused": "Paused: {path}",
+            "status_playback_stopped": "Stopped (0s): {path}",
             "hint_virtual_routing": "Tip: For external apps (Discord/Voice Recorder), route output to a virtual audio cable device.",
             "dialog_device_error": "Device Error",
             "dialog_missing_device": "Missing Device",
@@ -503,6 +520,7 @@ class MainWindow(QMainWindow):
             "dialog_save_as": "Save Recording As",
             "dialog_select_folder": "Select Save Folder",
             "filter_wav": "WAV files (*.wav)",
+            "filter_audio_save": "Audio files (*.wav *.m4a);;WAV files (*.wav);;M4A files (*.m4a)",
             "dialog_stream_not_running": "Stream Not Running",
             "msg_start_processing_first": "Start audio processing first, then record processed sound.",
             "dialog_save_error": "Save Error",
@@ -513,13 +531,17 @@ class MainWindow(QMainWindow):
             "dialog_processing_active": "Processing Active",
             "msg_playback_while_processing_locked": "Processing will not auto-stop while running. Click Stop Processing first, then play recording.",
             "dialog_stream_error": "Audio Stream Error",
+            "status_playback_done": "Playback finished: {path}",
+            "status_playback_position": "{current:.2f}s / {total:.2f}s",
+            "msg_m4a_dep_missing": "`imageio-ffmpeg` is required for M4A support.",
+            "msg_m4a_convert_failed": "M4A conversion/loading failed: {reason}",
         },
     }
 
     def __init__(self) -> None:
         """엔진/상태를 초기화하고 UI를 구성한 뒤 타이머 갱신을 시작"""
         super().__init__()
-        self.resize(1180, 860)
+        self.resize(1280, 940)
         pg.setConfigOptions(antialias=True)
 
         self.engine = AudioEngine()
@@ -527,6 +549,15 @@ class MainWindow(QMainWindow):
         self.current_language = "ko"
         self.slider_title_labels: dict[str, QLabel] = {}
         self.process_end_mode = "auto"
+        self.playback_stream: Optional[sd.OutputStream] = None
+        self.playback_audio: Optional[np.ndarray] = None
+        self.playback_samplerate = 0
+        self.playback_total_frames = 0
+        self.playback_current_frame = 0
+        self.playback_source_path: Optional[Path] = None
+        self.playback_output_device: Optional[int] = None
+        self.playback_lock = threading.Lock()
+        self.playback_cursor_internal_update = False
 
         self._build_ui()
         self._apply_language()
@@ -745,20 +776,36 @@ class MainWindow(QMainWindow):
         self.plot_group = QGroupBox()
         plot_layout = QVBoxLayout(self.plot_group)
         self.live_plot = pg.PlotWidget()
-        self.live_plot.setYRange(-1.0, 1.0)
+        self.live_plot.setYRange(-2.0, 2.0)
         self.live_plot.showGrid(x=True, y=True, alpha=0.22)
+        self.live_plot.setMinimumHeight(150)
+        self.live_plot.setMouseEnabled(x=False, y=False)
+        self.live_plot.setMenuEnabled(False)
         self.live_curve = self.live_plot.plot(pen=pg.mkPen(color="#3f9f5f", width=1.5))
 
         self.recorded_plot = pg.PlotWidget()
-        self.recorded_plot.setYRange(-1.0, 1.0)
+        self.recorded_plot.setYRange(-2.0, 2.0)
         self.recorded_plot.showGrid(x=True, y=True, alpha=0.22)
+        self.recorded_plot.setMinimumHeight(300)
+        self.recorded_plot.setMouseEnabled(x=False, y=False)
+        self.recorded_plot.setMenuEnabled(False)
         self.recorded_curve = self.recorded_plot.plot(
             pen=pg.mkPen(color="#2f5fa0", width=1.2)
         )
+        self.playback_cursor = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=True, pen=pg.mkPen("#ff8a00", width=2)
+        )
+        self.playback_cursor.setBounds((0.0, 1.0))
+        self.playback_cursor.setZValue(10)
+        self.playback_cursor.sigPositionChanged.connect(self._on_playback_cursor_moved)
+        self.recorded_plot.addItem(self.playback_cursor)
+        self.playback_cursor.hide()
 
         plot_layout.addWidget(self.live_plot)
         plot_layout.addWidget(self.recorded_plot)
-        root_layout.addWidget(self.plot_group, 1)
+        plot_layout.setStretch(0, 1)
+        plot_layout.setStretch(1, 3)
+        root_layout.addWidget(self.plot_group, 2)
 
         # 4) 녹음/저장/재생 및 모니터링 모드 영역
         self.rec_group = QGroupBox()
@@ -788,6 +835,9 @@ class MainWindow(QMainWindow):
         self.rec_stop_btn.setEnabled(False)
         self.play_btn = QPushButton()
         self.play_btn.clicked.connect(self._play_recording)
+        self.stop_playback_btn = QPushButton()
+        self.stop_playback_btn.clicked.connect(self._stop_playback_to_start)
+        self.stop_playback_btn.setEnabled(False)
 
         self.record_status = QLabel()
         self.routing_hint = QLabel()
@@ -799,6 +849,7 @@ class MainWindow(QMainWindow):
         rec_layout.addWidget(self.rec_start_btn, 1, 1)
         rec_layout.addWidget(self.rec_stop_btn, 1, 2)
         rec_layout.addWidget(self.play_btn, 1, 3)
+        rec_layout.addWidget(self.stop_playback_btn, 1, 4)
         rec_layout.addWidget(self.record_mode_label, 2, 0)
         rec_layout.addWidget(self.record_mode_combo, 2, 1, 1, 3)
         rec_layout.addWidget(self.record_status, 3, 1, 1, 4)
@@ -839,7 +890,7 @@ class MainWindow(QMainWindow):
         )
         self.rec_start_btn.setText(self._t("btn_start_recording"))
         self.rec_stop_btn.setText(self._t("btn_stop_and_save"))
-        self.play_btn.setText(self._t("btn_play_last"))
+        self.stop_playback_btn.setText(self._t("btn_stop_playback"))
         self.routing_hint.setText(self._t("hint_virtual_routing"))
 
         for key, label in self.slider_title_labels.items():
@@ -860,6 +911,8 @@ class MainWindow(QMainWindow):
                 )
         else:
             self.stream_label.setText(self._t("status_stopped"))
+
+        self._refresh_playback_buttons()
 
     def _add_slider(
         self,
@@ -948,6 +1001,320 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(0)
 
     # -------- 스트림/녹음/재생 제어 --------
+    @staticmethod
+    def _normalize_record_file_path(path: Path) -> Path:
+        """녹음 저장 경로를 wav/m4a 중 지원 확장자로 정규화한다."""
+        suffix = path.suffix.lower()
+        if suffix in {".wav", ".m4a"}:
+            return path
+        if suffix:
+            return path.with_suffix(".wav")
+        return path.with_suffix(".wav")
+
+    @staticmethod
+    def _run_subprocess_or_raise(command: List[str]) -> None:
+        """외부 명령 실행 실패 시 stderr를 포함한 예외를 발생시킨다."""
+        proc = subprocess.run(command, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            reason = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
+            raise RuntimeError(reason)
+
+    def _get_ffmpeg_executable(self) -> str:
+        """m4a 처리에 사용할 ffmpeg 실행 파일 경로를 반환한다."""
+        try:
+            from imageio_ffmpeg import get_ffmpeg_exe
+        except Exception as exc:
+            raise RuntimeError(self._t("msg_m4a_dep_missing")) from exc
+        try:
+            return str(get_ffmpeg_exe())
+        except Exception as exc:
+            raise RuntimeError(self._t("msg_m4a_dep_missing")) from exc
+
+    def _save_audio_file(self, save_path: Path, audio: np.ndarray, samplerate: int) -> None:
+        """선택된 확장자에 맞춰 WAV 또는 M4A로 저장한다."""
+        suffix = save_path.suffix.lower()
+        if suffix == ".m4a":
+            ffmpeg = self._get_ffmpeg_executable()
+            with tempfile.TemporaryDirectory(prefix="ve_m4a_encode_") as tmp_dir:
+                tmp_wav = Path(tmp_dir) / "input.wav"
+                sf.write(str(tmp_wav), audio, samplerate, subtype="PCM_16")
+                command = [
+                    ffmpeg,
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(tmp_wav),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    str(save_path),
+                ]
+                try:
+                    self._run_subprocess_or_raise(command)
+                except Exception as exc:
+                    raise RuntimeError(
+                        self._t("msg_m4a_convert_failed", reason=str(exc))
+                    ) from exc
+            return
+
+        sf.write(str(save_path), audio, samplerate, subtype="PCM_16")
+
+    def _load_audio_file(self, source_path: Path) -> Tuple[np.ndarray, int]:
+        """파일을 float32 2D 배열(프레임, 채널)로 로드한다."""
+        try:
+            data, samplerate = sf.read(
+                str(source_path), dtype="float32", always_2d=True
+            )
+            return data, int(samplerate)
+        except Exception:
+            if source_path.suffix.lower() != ".m4a":
+                raise
+
+            ffmpeg = self._get_ffmpeg_executable()
+            with tempfile.TemporaryDirectory(prefix="ve_m4a_decode_") as tmp_dir:
+                decoded_wav = Path(tmp_dir) / "decoded.wav"
+                command = [
+                    ffmpeg,
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(source_path),
+                    "-vn",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(decoded_wav),
+                ]
+                try:
+                    self._run_subprocess_or_raise(command)
+                    data, samplerate = sf.read(
+                        str(decoded_wav), dtype="float32", always_2d=True
+                    )
+                    return data, int(samplerate)
+                except Exception as exc:
+                    raise RuntimeError(
+                        self._t("msg_m4a_convert_failed", reason=str(exc))
+                    ) from exc
+
+    def _prepare_playback_audio_for_device(
+        self, source_path: Path, output_device: int
+    ) -> None:
+        """재생 소스를 로드하고 출력 장치 채널 수에 맞춘다."""
+        resolved_path = source_path.expanduser().resolve()
+        should_reload = (
+            self.playback_audio is None
+            or self.playback_source_path != resolved_path
+            or self.playback_output_device != output_device
+        )
+        if not should_reload:
+            return
+
+        data, samplerate = self._load_audio_file(resolved_path)
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
+
+        out_info = sd.query_devices(output_device)
+        max_channels = int(out_info["max_output_channels"])
+        if max_channels < 1:
+            raise RuntimeError(self._t("msg_select_output_before_playback"))
+
+        if data.shape[1] > max_channels:
+            data = data[:, :max_channels]
+        elif data.shape[1] == 1 and max_channels >= 2:
+            data = np.repeat(data, 2, axis=1)
+
+        data = np.ascontiguousarray(data.astype(np.float32, copy=False))
+        total_frames = int(data.shape[0])
+        with self.playback_lock:
+            self.playback_audio = data
+            self.playback_samplerate = int(samplerate)
+            self.playback_total_frames = total_frames
+            self.playback_current_frame = 0
+
+        self.playback_source_path = resolved_path
+        self.playback_output_device = output_device
+        duration_seconds = total_frames / float(samplerate) if samplerate > 0 else 0.0
+        self._set_recorded_time_axis(duration_seconds)
+        self._set_playback_cursor_seconds(0.0)
+        if total_frames > 0:
+            self.playback_cursor.show()
+        else:
+            self.playback_cursor.hide()
+        self._refresh_playback_buttons()
+
+    def _is_playback_running(self) -> bool:
+        """재생 스트림 활성 상태를 확인한다."""
+        stream = self.playback_stream
+        if stream is None:
+            return False
+        try:
+            return bool(stream.active)
+        except Exception:
+            return False
+
+    def _get_playback_status_path(self) -> Optional[Path]:
+        """상태 표시용 현재 재생 파일 경로를 반환한다."""
+        if self.playback_source_path is not None:
+            return self.playback_source_path
+        if self.last_recording_path is not None:
+            return self.last_recording_path
+        maybe_path = Path(self.path_edit.text().strip()).expanduser()
+        if maybe_path.exists():
+            return maybe_path
+        return None
+
+    def _refresh_playback_buttons(self) -> None:
+        """재생/일시정지 토글 텍스트와 정지 버튼 활성 상태를 갱신한다."""
+        if self.engine.is_running():
+            self.play_btn.setEnabled(False)
+            self.stop_playback_btn.setEnabled(False)
+            self.play_btn.setText(self._t("btn_play_pause_play"))
+            return
+
+        is_running = self._is_playback_running()
+        self.play_btn.setEnabled(True)
+        if is_running:
+            self.play_btn.setText(self._t("btn_play_pause_pause"))
+        else:
+            self.play_btn.setText(self._t("btn_play_pause_play"))
+
+        with self.playback_lock:
+            has_position = (
+                self.playback_total_frames > 0 and self.playback_current_frame > 0
+            )
+        self.stop_playback_btn.setEnabled(is_running or has_position)
+
+    def _stop_playback_to_start(self) -> None:
+        """재생을 정지하고 위치를 0초로 되돌린다."""
+        if self._is_playback_running():
+            self._stop_playback_stream()
+        self._seek_playback_frame(0)
+        self._set_playback_cursor_seconds(0.0)
+        status_path = self._get_playback_status_path()
+        if status_path is not None:
+            self.record_status.setText(
+                self._t("status_playback_stopped", path=status_path)
+            )
+        self._refresh_playback_buttons()
+
+    def _stop_playback_stream(self, clear_audio: bool = False) -> None:
+        """재생 스트림을 정지하고 필요하면 재생 버퍼까지 초기화한다."""
+        stream = self.playback_stream
+        self.playback_stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+        if clear_audio:
+            with self.playback_lock:
+                self.playback_audio = None
+                self.playback_samplerate = 0
+                self.playback_total_frames = 0
+                self.playback_current_frame = 0
+            self.playback_source_path = None
+            self.playback_output_device = None
+            self._set_recorded_time_axis(1.0)
+            self._set_playback_cursor_seconds(0.0)
+            self.playback_cursor.hide()
+
+        if hasattr(self, "play_btn"):
+            self._refresh_playback_buttons()
+
+    def _seek_playback_frame(self, frame: int) -> None:
+        """재생 커서를 지정 프레임으로 이동한다."""
+        with self.playback_lock:
+            total = self.playback_total_frames
+            if total <= 0:
+                self.playback_current_frame = 0
+                return
+            self.playback_current_frame = int(np.clip(frame, 0, total))
+
+    def _set_recorded_time_axis(self, duration_seconds: float) -> None:
+        """녹음 파형 X축을 항상 0초부터 시작하도록 고정한다."""
+        max_time = max(float(duration_seconds), 0.01)
+        self.recorded_plot.setLimits(xMin=0.0, xMax=max_time, yMin=-2.0, yMax=2.0)
+        self.recorded_plot.setXRange(0.0, max_time, padding=0.0)
+        self.recorded_plot.setYRange(-2.0, 2.0, padding=0.0)
+        self.playback_cursor.setBounds((0.0, max_time))
+
+    def _set_playback_cursor_seconds(self, seconds: float) -> None:
+        """파형 위 세로 막대(|)를 지정 시간 위치로 이동한다."""
+        lower, upper = self.playback_cursor.bounds()
+        clamped = float(np.clip(seconds, lower, upper))
+        self.playback_cursor_internal_update = True
+        self.playback_cursor.setValue(clamped)
+        self.playback_cursor_internal_update = False
+
+    def _get_playback_cursor_seconds(self) -> float:
+        """파형 위 세로 막대(|)의 현재 시간을 반환한다."""
+        return max(0.0, float(self.playback_cursor.value()))
+
+    def _on_playback_cursor_moved(self) -> None:
+        """사용자가 세로 막대를 움직이면 해당 지점으로 재생 위치를 이동한다."""
+        if self.playback_cursor_internal_update:
+            return
+        with self.playback_lock:
+            total_frames = self.playback_total_frames
+            samplerate = self.playback_samplerate
+        if total_frames <= 0 or samplerate <= 0:
+            return
+        target_seconds = self._get_playback_cursor_seconds()
+        target_frame = int(round(target_seconds * float(samplerate)))
+        self._seek_playback_frame(target_frame)
+        self._refresh_playback_buttons()
+
+    def _playback_callback(
+        self,
+        outdata: np.ndarray,
+        frames: int,
+        time_info,
+        status: sd.CallbackFlags,
+    ) -> None:
+        """재생 커서 기준으로 오디오 블록을 출력 버퍼에 채운다."""
+        _ = time_info
+        _ = status
+        with self.playback_lock:
+            audio = self.playback_audio
+            total = self.playback_total_frames
+            cursor = self.playback_current_frame
+            if audio is None or total <= 0:
+                outdata.fill(0.0)
+                raise sd.CallbackStop()
+
+            start = int(np.clip(cursor, 0, total))
+            end = min(start + frames, total)
+            chunk = audio[start:end]
+            self.playback_current_frame = end
+            is_finished = end >= total
+
+        outdata.fill(0.0)
+        if chunk.size > 0:
+            outdata[: chunk.shape[0], : chunk.shape[1]] = chunk
+        if is_finished:
+            raise sd.CallbackStop()
+
+    def _sync_playback_cursor_line(self) -> None:
+        """재생 중 현재 프레임을 파형 위 세로 막대(|)로 동기화한다."""
+        with self.playback_lock:
+            total = self.playback_total_frames
+            frame = self.playback_current_frame
+            samplerate = self.playback_samplerate
+
+        if total <= 0 or samplerate <= 0:
+            return
+
+        frame = int(np.clip(frame, 0, total))
+        seconds = frame / float(samplerate)
+        self._set_playback_cursor_seconds(seconds)
+
     def _start_stream(self) -> None:
         """선택 장치로 스트림을 시작하고 UI 상태를 실행 중으로 전환"""
         input_dev = self.input_combo.currentData()
@@ -961,6 +1328,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            self._stop_playback_stream()
             self.engine.set_devices(int(input_dev), int(output_dev))
             samplerate = self.engine.start()
         except Exception as exc:
@@ -970,7 +1338,7 @@ class MainWindow(QMainWindow):
         self.stream_label.setText(self._t("status_running_sr", samplerate=samplerate))
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.play_btn.setEnabled(False)
+        self._refresh_playback_buttons()
 
     def _stop_stream(self) -> None:
         """스트림을 중지하고 UI 상태를 대기 상태로 복귀시킨다."""
@@ -981,20 +1349,25 @@ class MainWindow(QMainWindow):
         self.stream_label.setText(self._t("status_stopped"))
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.play_btn.setEnabled(True)
         self.rec_start_btn.setEnabled(True)
         self.rec_stop_btn.setEnabled(False)
+        self._refresh_playback_buttons()
 
     def _browse_record_file(self) -> None:
         """사용자가 저장할 WAV 파일 경로를 직접 선택가능하게 한다."""
         current = self.path_edit.text().strip() or str(Path.cwd() / "recording.wav")
-        path, _ = QFileDialog.getSaveFileName(
-            self, self._t("dialog_save_as"), current, self._t("filter_wav")
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, self._t("dialog_save_as"), current, self._t("filter_audio_save")
         )
         if path:
-            if not path.lower().endswith(".wav"):
-                path += ".wav"
-            self.path_edit.setText(path)
+            selected_path = Path(path).expanduser()
+            if selected_path.suffix.lower() not in {".wav", ".m4a"}:
+                if "m4a" in selected_filter.lower():
+                    selected_path = selected_path.with_suffix(".m4a")
+                else:
+                    selected_path = selected_path.with_suffix(".wav")
+            normalized = self._normalize_record_file_path(selected_path)
+            self.path_edit.setText(str(normalized))
 
     def _select_save_folder(self) -> None:
         """저장 폴더를 선택하고 파일명은 기존 값 또는 기본값으로 유지"""
@@ -1011,7 +1384,7 @@ class MainWindow(QMainWindow):
 
         filename = (
             current_path.name
-            if current_path.suffix.lower() == ".wav"
+            if current_path.suffix.lower() in {".wav", ".m4a"}
             else "recording.wav"
         )
         self.path_edit.setText(str(Path(folder) / filename))
@@ -1027,6 +1400,7 @@ class MainWindow(QMainWindow):
             return
 
         # 재녹음 시에도 선택 모드가 누락되지 않도록 시작 시점에 모드를 재적용.
+        self._stop_playback_stream()
         self.engine.start_recording(self._get_selected_record_output_mode())
         self.record_status.setText(self._t("status_recording"))
         self.rec_start_btn.setEnabled(False)
@@ -1055,19 +1429,29 @@ class MainWindow(QMainWindow):
         if save_path.exists() and save_path.is_dir():
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_path = save_path / f"recording_{stamp}.wav"
-        elif save_path.suffix.lower() != ".wav":
-            save_path = save_path.with_suffix(".wav")
+        save_path = self._normalize_record_file_path(save_path)
 
         self.path_edit.setText(str(save_path))
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            sf.write(str(save_path), audio, samplerate, subtype="PCM_16")
+            self._save_audio_file(save_path, audio, samplerate)
         except Exception as exc:
             QMessageBox.critical(self, self._t("dialog_save_error"), str(exc))
             return
 
+        self._stop_playback_stream(clear_audio=True)
         self.last_recording_path = save_path
+        total_frames = int(audio.shape[0])
+        with self.playback_lock:
+            self.playback_total_frames = total_frames
+            self.playback_samplerate = int(samplerate)
+            self.playback_current_frame = 0
+        self.playback_source_path = save_path.resolve()
+        self.playback_output_device = None
+        self._set_playback_cursor_seconds(0.0)
+        self._refresh_playback_buttons()
+
         duration = len(audio) / float(samplerate)
         self.record_status.setText(
             self._t("status_saved", path=save_path, duration=duration)
@@ -1079,8 +1463,18 @@ class MainWindow(QMainWindow):
 
     def _play_recording(self) -> None:
         """저장된 녹음 파일을 선택된 출력 장치로 재생"""
+        if self._is_playback_running():
+            self._stop_playback_stream()
+            status_path = self._get_playback_status_path()
+            if status_path is not None:
+                self.record_status.setText(
+                    self._t("status_playback_paused", path=status_path)
+                )
+            self._refresh_playback_buttons()
+            return
+
         if self.last_recording_path is None:
-            maybe_path = Path(self.path_edit.text().strip())
+            maybe_path = Path(self.path_edit.text().strip()).expanduser()
             if maybe_path.exists():
                 self.last_recording_path = maybe_path
             else:
@@ -1107,16 +1501,42 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            data, samplerate = sf.read(str(self.last_recording_path), dtype="float32")
-            if data.ndim == 1:
-                out_info = sd.query_devices(int(output_dev))
-                if int(out_info["max_output_channels"]) >= 2:
-                    data = np.column_stack((data, data))
-            sd.play(data, samplerate=samplerate, device=int(output_dev))
+            target_seconds = self._get_playback_cursor_seconds()
+            self._prepare_playback_audio_for_device(
+                self.last_recording_path, int(output_dev)
+            )
+
+            with self.playback_lock:
+                audio = self.playback_audio
+                samplerate = self.playback_samplerate
+                total = self.playback_total_frames
+                if audio is None or total <= 0:
+                    raise RuntimeError(self._t("msg_record_first"))
+                target_frame = int(round(target_seconds * float(samplerate)))
+                target_frame = int(np.clip(target_frame, 0, total))
+                if target_frame >= total:
+                    target_frame = 0
+                self.playback_current_frame = target_frame
+                channels = int(audio.shape[1])
+
+            self._plot_recorded(audio[:, 0], samplerate)
+            self._set_playback_cursor_seconds(target_frame / float(samplerate))
+
+            self.playback_stream = sd.OutputStream(
+                samplerate=samplerate,
+                blocksize=self.engine.block_size,
+                device=int(output_dev),
+                channels=channels,
+                dtype="float32",
+                callback=self._playback_callback,
+            )
+            self.playback_stream.start()
             self.record_status.setText(
                 self._t("status_playing", path=self.last_recording_path)
             )
+            self._refresh_playback_buttons()
         except Exception as exc:
+            self._stop_playback_stream()
             QMessageBox.critical(self, self._t("dialog_playback_error"), str(exc))
 
     # -------- 실시간 표시/종료 처리 --------
@@ -1125,6 +1545,14 @@ class MainWindow(QMainWindow):
         samples = self.engine.get_latest_output()
         if samples.size > 0:
             self.live_curve.setData(samples)
+        self._sync_playback_cursor_line()
+        if self.playback_stream is not None and not self._is_playback_running():
+            self._stop_playback_stream()
+            if self.playback_source_path is not None:
+                self.record_status.setText(
+                    self._t("status_playback_done", path=self.playback_source_path)
+                )
+
         status = self.engine.last_stream_status
         if self.engine.is_running():
             if status:
@@ -1144,19 +1572,26 @@ class MainWindow(QMainWindow):
         """녹음 데이터를 다운샘플링해 기록 파형 플롯에 그린다."""
         if audio.ndim > 1:
             audio = audio[:, 0]
-        if audio.size == 0:
+        if audio.size == 0 or samplerate <= 0:
             self.recorded_curve.setData([])
+            self._set_recorded_time_axis(1.0)
+            self.playback_cursor.hide()
             return
 
-        step = max(1, audio.size // 12000)
+        duration = len(audio) / float(samplerate)
+        step = max(1, audio.size // 20000)
         trimmed = audio[::step]
-        times = np.linspace(0.0, len(audio) / samplerate, num=len(trimmed))
+        times = np.arange(trimmed.size, dtype=np.float64) * (step / float(samplerate))
         self.recorded_curve.setData(times, trimmed)
         self.recorded_plot.setLabel("bottom", self._t("plot_time_label"), units="s")
+        self._set_recorded_time_axis(duration)
+        self.playback_cursor.show()
+        self._sync_playback_cursor_line()
 
     def closeEvent(self, event) -> None:
         """창 종료 시 오디오 스트림과 재생을 정리"""
         try:
+            self._stop_playback_stream(clear_audio=True)
             self.engine.stop()
             sd.stop()
         except Exception:
