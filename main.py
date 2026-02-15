@@ -1,4 +1,6 @@
-import copy
+﻿import copy
+import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -6,19 +8,20 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
 import sounddevice as sd
 import soundfile as sf
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QGridLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -28,6 +31,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QComboBox,
+    QStyle,
+    QTabWidget,
 )
 
 
@@ -60,7 +65,8 @@ class AudioEngine:
         self.params = EffectParams()
         self.stream: Optional[sd.Stream] = None
         self.sample_rate = 48000
-        self.block_size = 1024
+        # UI 이벤트가 많은 상황에서도 끊김을 줄이기 위해 버퍼를 조금 크게 둔다.
+        self.block_size = 2048
         self.input_channels = 1
         self.output_channels = 1
         self.input_device: Optional[int] = None
@@ -194,6 +200,7 @@ class AudioEngine:
             channels=(self.input_channels, self.output_channels),
             samplerate=self.sample_rate,
             blocksize=self.block_size,
+            latency="high",
             dtype="float32",
             callback=self._audio_callback,
         )
@@ -390,10 +397,18 @@ class MainWindow(QMainWindow):
             "group_effects_gain": "이펙트 및 게인",
             "group_waveforms": "파형",
             "group_recording": "녹음",
+            "tab_effects": "이펙트",
+            "tab_studio": "스튜디오",
+            "tab_waveforms": "파형 보기",
+            "tab_recording": "녹음/재생",
             "label_input_mic": "입력 마이크",
             "label_output_speaker": "출력 스피커",
             "label_language": "언어",
+            "label_theme": "테마",
             "label_process_end_mode": "처리 종료 모드",
+            "theme_light": "라이트 모드",
+            "theme_dark": "다크 모드",
+            "device_unassigned": "장치 미할당",
             "btn_refresh_devices": "장치 새로고침",
             "btn_start_processing": "처리 시작",
             "btn_stop_processing": "처리 중지",
@@ -459,6 +474,24 @@ class MainWindow(QMainWindow):
             "status_playback_position": "{current:.2f}초 / {total:.2f}초",
             "msg_m4a_dep_missing": "M4A 처리를 위해 `imageio-ffmpeg` 패키지가 필요합니다.",
             "msg_m4a_convert_failed": "M4A 변환/로딩에 실패했습니다: {reason}",
+            "group_presets_settings": "프리셋 및 설정",
+            "label_preset": "기본 프리셋",
+            "btn_apply_preset": "프리셋 적용",
+            "btn_save_settings": "세팅 저장",
+            "btn_load_settings": "세팅 불러오기",
+            "btn_reset_defaults": "기본값 초기화",
+            "preset_custom": "사용자 직접 설정",
+            "preset_stage": "무대공연",
+            "preset_karaoke": "노래방",
+            "preset_clean_boost": "클린 부스트",
+            "dialog_save_settings": "세팅 저장",
+            "dialog_load_settings": "세팅 불러오기",
+            "filter_json": "JSON 파일 (*.json)",
+            "dialog_settings_error": "세팅 오류",
+            "status_preset_applied": "프리셋 적용 완료: {name}",
+            "status_settings_saved": "세팅 저장 완료: {path}",
+            "status_settings_loaded": "세팅 불러오기 완료: {path}",
+            "status_settings_reset": "기본값으로 초기화했습니다.",
         },
         "en": {
             "window_title": "Ondanbi VE Studio",
@@ -466,10 +499,18 @@ class MainWindow(QMainWindow):
             "group_effects_gain": "Effects and Gain",
             "group_waveforms": "Waveforms",
             "group_recording": "Recording",
+            "tab_effects": "Effects",
+            "tab_studio": "Studio",
+            "tab_waveforms": "Waveforms",
+            "tab_recording": "Record/Playback",
             "label_input_mic": "Input Mic",
             "label_output_speaker": "Output Speaker",
             "label_language": "Language",
+            "label_theme": "Theme",
             "label_process_end_mode": "Process End Mode",
+            "theme_light": "Light Mode",
+            "theme_dark": "Dark Mode",
+            "device_unassigned": "Unassigned",
             "btn_refresh_devices": "Refresh Devices",
             "btn_start_processing": "Start Processing",
             "btn_stop_processing": "Stop Processing",
@@ -535,6 +576,63 @@ class MainWindow(QMainWindow):
             "status_playback_position": "{current:.2f}s / {total:.2f}s",
             "msg_m4a_dep_missing": "`imageio-ffmpeg` is required for M4A support.",
             "msg_m4a_convert_failed": "M4A conversion/loading failed: {reason}",
+            "group_presets_settings": "Presets and Settings",
+            "label_preset": "Built-in Presets",
+            "btn_apply_preset": "Apply Preset",
+            "btn_save_settings": "Save Settings",
+            "btn_load_settings": "Load Settings",
+            "btn_reset_defaults": "Reset Defaults",
+            "preset_custom": "Custom",
+            "preset_stage": "Stage Performance",
+            "preset_karaoke": "Karaoke",
+            "preset_clean_boost": "Clean Boost",
+            "dialog_save_settings": "Save Settings",
+            "dialog_load_settings": "Load Settings",
+            "filter_json": "JSON files (*.json)",
+            "dialog_settings_error": "Settings Error",
+            "status_preset_applied": "Preset applied: {name}",
+            "status_settings_saved": "Settings saved: {path}",
+            "status_settings_loaded": "Settings loaded: {path}",
+            "status_settings_reset": "Reset to defaults.",
+        },
+    }
+
+    PRESET_VALUES: Dict[str, Dict[str, int]] = {
+        "stage": {
+            "input_gain": 120,
+            "output_gain": 120,
+            "distortion": 35,
+            "reverb": 35,
+            "delay_mix": 15,
+            "delay_time": 260,
+            "delay_feedback": 25,
+            "echo_mix": 10,
+            "echo_time": 420,
+            "echo_feedback": 20,
+        },
+        "karaoke": {
+            "input_gain": 110,
+            "output_gain": 115,
+            "distortion": 0,
+            "reverb": 24,
+            "delay_mix": 12,
+            "delay_time": 180,
+            "delay_feedback": 18,
+            "echo_mix": 8,
+            "echo_time": 320,
+            "echo_feedback": 12,
+        },
+        "clean_boost": {
+            "input_gain": 125,
+            "output_gain": 125,
+            "distortion": 0,
+            "reverb": 0,
+            "delay_mix": 0,
+            "delay_time": 0,
+            "delay_feedback": 0,
+            "echo_mix": 0,
+            "echo_time": 0,
+            "echo_feedback": 0,
         },
     }
 
@@ -542,12 +640,17 @@ class MainWindow(QMainWindow):
         """엔진/상태를 초기화하고 UI를 구성한 뒤 타이머 갱신을 시작"""
         super().__init__()
         self.resize(1280, 940)
-        pg.setConfigOptions(antialias=True)
+        # 실시간 파형 렌더 부하를 줄여 오디오 콜백 안정성 확보
+        pg.setConfigOptions(antialias=False)
+        pg.setConfigOption("background", "#fbfdff")
+        pg.setConfigOption("foreground", "#344861")
 
         self.engine = AudioEngine()
         self.last_recording_path: Optional[Path] = None
         self.current_language = "ko"
+        self.current_theme = "light"
         self.slider_title_labels: dict[str, QLabel] = {}
+        self.preset_keys_in_order = ["custom", "stage", "karaoke", "clean_boost"]
         self.process_end_mode = "auto"
         self.playback_stream: Optional[sd.OutputStream] = None
         self.playback_audio: Optional[np.ndarray] = None
@@ -558,14 +661,21 @@ class MainWindow(QMainWindow):
         self.playback_output_device: Optional[int] = None
         self.playback_lock = threading.Lock()
         self.playback_cursor_internal_update = False
+        self.live_wave_visible = False
+        self.last_cursor_frame_synced = -1
+        self.stream_button_running_state: Optional[bool] = None
+        self.playback_button_signature: Optional[Tuple[bool, bool, bool, str]] = None
+        self.stream_expected_running = False
 
         self._build_ui()
+        self._apply_theme()
         self._apply_language()
         self._load_devices()
         self._sync_all_params()
 
         self.wave_timer = QTimer(self)
-        self.wave_timer.setInterval(40)
+        # 파형 갱신 빈도를 약간 낮춰 UI 부하와 GIL 경합을 줄인다.
+        self.wave_timer.setInterval(80)
         self.wave_timer.timeout.connect(self._update_live_waveform)
         self.wave_timer.start()
 
@@ -587,6 +697,70 @@ class MainWindow(QMainWindow):
             self.current_language = lang
             self._apply_language()
 
+    def _toggle_theme(self) -> None:
+        """달/태양 버튼 클릭 시 다크/라이트 테마를 전환."""
+        self.current_theme = "dark" if self.current_theme == "light" else "light"
+        self._apply_theme()
+
+    @staticmethod
+    def _create_theme_icon(kind: str) -> QIcon:
+        """테마 토글용 달/태양 아이콘 생성."""
+        pixmap = QPixmap(20, 20)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        if kind == "moon":
+            moon_color = QColor("#334155")
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(moon_color)
+            painter.drawEllipse(3, 3, 14, 14)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.drawEllipse(8, 2, 12, 16)
+        else:
+            sun_color = QColor("#f59e0b")
+            pen = QPen(sun_color)
+            pen.setWidth(2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(sun_color)
+            painter.drawEllipse(6, 6, 8, 8)
+            rays = [
+                ((10, 1), (10, 4)),
+                ((10, 16), (10, 19)),
+                ((1, 10), (4, 10)),
+                ((16, 10), (19, 10)),
+                ((3, 3), (5, 5)),
+                ((15, 15), (17, 17)),
+                ((15, 5), (17, 3)),
+                ((3, 17), (5, 15)),
+            ]
+            for start, end in rays:
+                painter.drawLine(start[0], start[1], end[0], end[1])
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def _refresh_theme_toggle_button(self) -> None:
+        """현재 테마 상태에 맞춰 토글 버튼의 아이콘/툴팁을 갱신."""
+        if not hasattr(self, "theme_toggle_btn"):
+            return
+        if self.current_theme == "light":
+            self.theme_toggle_btn.setIcon(self._create_theme_icon("moon"))
+            self.theme_toggle_btn.setToolTip(self._t("theme_dark"))
+            self.theme_toggle_btn.setStatusTip(self._t("theme_dark"))
+        else:
+            self.theme_toggle_btn.setIcon(self._create_theme_icon("sun"))
+            self.theme_toggle_btn.setToolTip(self._t("theme_light"))
+            self.theme_toggle_btn.setStatusTip(self._t("theme_light"))
+
+    def _toggle_stream(self) -> None:
+        """처리 시작/중지 단일 버튼 토글 동작."""
+        if self.engine.is_running():
+            self._stop_stream()
+        else:
+            self._start_stream()
+
     def _on_record_output_mode_changed(self) -> None:
         """모니터링 모드 콤보 박스 변경을 엔진 설정으로 반영."""
         self.engine.set_record_output_mode(self._get_selected_record_output_mode())
@@ -604,16 +778,525 @@ class MainWindow(QMainWindow):
             return str(mode)
         return "mute_while_recording"
 
+    @staticmethod
+    def _settings_default_path() -> Path:
+        """세팅 JSON의 기본 저장 경로를 반환."""
+        return Path.cwd() / "voice_settings.json"
+
+    def _rebuild_preset_combo(self) -> None:
+        """현재 언어 기준으로 프리셋 콤보 항목을 다시 구성."""
+        previous = (
+            self.preset_combo.currentData() if hasattr(self, "preset_combo") else None
+        )
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for preset_key in self.preset_keys_in_order:
+            self.preset_combo.addItem(self._t(f"preset_{preset_key}"), preset_key)
+        restored_index = self.preset_combo.findData(previous)
+        if restored_index < 0:
+            restored_index = self.preset_combo.findData("custom")
+        if restored_index >= 0:
+            self.preset_combo.setCurrentIndex(restored_index)
+        self.preset_combo.blockSignals(False)
+
+    def _capture_slider_settings(self) -> Dict[str, int]:
+        """현재 슬라이더 값을 직렬화 가능한 dict로 수집."""
+        return {
+            "input_gain": int(self.input_gain_slider.value()),
+            "output_gain": int(self.output_gain_slider.value()),
+            "distortion": int(self.distortion_slider.value()),
+            "reverb": int(self.reverb_slider.value()),
+            "delay_mix": int(self.delay_mix_slider.value()),
+            "delay_time": int(self.delay_time_slider.value()),
+            "delay_feedback": int(self.delay_feedback_slider.value()),
+            "echo_mix": int(self.echo_mix_slider.value()),
+            "echo_time": int(self.echo_time_slider.value()),
+            "echo_feedback": int(self.echo_feedback_slider.value()),
+        }
+
+    def _clamp_slider_value(self, slider: QSlider, value: Any) -> int:
+        """슬라이더 범위에 맞게 값을 정수로 보정."""
+        try:
+            as_int = int(round(float(value)))
+        except Exception:
+            as_int = slider.value()
+        return int(np.clip(as_int, slider.minimum(), slider.maximum()))
+
+    def _apply_slider_settings(self, values: Dict[str, Any]) -> None:
+        """슬라이더 값 dict를 UI와 엔진 파라미터에 반영."""
+        mapping: Dict[str, QSlider] = {
+            "input_gain": self.input_gain_slider,
+            "output_gain": self.output_gain_slider,
+            "distortion": self.distortion_slider,
+            "reverb": self.reverb_slider,
+            "delay_mix": self.delay_mix_slider,
+            "delay_time": self.delay_time_slider,
+            "delay_feedback": self.delay_feedback_slider,
+            "echo_mix": self.echo_mix_slider,
+            "echo_time": self.echo_time_slider,
+            "echo_feedback": self.echo_feedback_slider,
+        }
+        for key, slider in mapping.items():
+            if key in values:
+                slider.setValue(self._clamp_slider_value(slider, values[key]))
+
+    def _collect_settings_payload(self) -> Dict[str, Any]:
+        """현재 UI 상태를 JSON 저장용 payload로 구성."""
+        return {
+            "schema_version": 1,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "language": str(self.language_combo.currentData() or self.current_language),
+            "theme": self.current_theme,
+            "process_end_mode": str(
+                self.process_end_mode_combo.currentData() or "auto"
+            ),
+            "record_output_mode": self._get_selected_record_output_mode(),
+            "record_save_path": self.path_edit.text().strip(),
+            "preset_key": str(self.preset_combo.currentData() or "custom"),
+            "sliders": self._capture_slider_settings(),
+        }
+
+    def _apply_settings_payload(self, payload: Dict[str, Any]) -> None:
+        """JSON payload를 UI 상태로 복원."""
+        if not isinstance(payload, dict):
+            raise RuntimeError("Invalid settings format.")
+
+        sliders = payload.get("sliders", {})
+        if isinstance(sliders, dict):
+            self._apply_slider_settings(sliders)
+
+        language = payload.get("language")
+        if isinstance(language, str):
+            idx = self.language_combo.findData(language)
+            if idx >= 0:
+                self.language_combo.setCurrentIndex(idx)
+
+        theme = payload.get("theme")
+        if isinstance(theme, str) and theme in {"light", "dark"}:
+            self.current_theme = theme
+            self._apply_theme()
+
+        process_mode = payload.get("process_end_mode")
+        if isinstance(process_mode, str):
+            idx = self.process_end_mode_combo.findData(process_mode)
+            if idx >= 0:
+                self.process_end_mode_combo.setCurrentIndex(idx)
+
+        record_mode = payload.get("record_output_mode")
+        if isinstance(record_mode, str):
+            idx = self.record_mode_combo.findData(record_mode)
+            if idx >= 0:
+                self.record_mode_combo.setCurrentIndex(idx)
+                self.engine.set_record_output_mode(record_mode)
+
+        save_path = payload.get("record_save_path")
+        if isinstance(save_path, str) and save_path.strip():
+            self.path_edit.setText(save_path.strip())
+
+        preset_key = payload.get("preset_key")
+        if isinstance(preset_key, str):
+            idx = self.preset_combo.findData(preset_key)
+            if idx >= 0:
+                self.preset_combo.setCurrentIndex(idx)
+
+        self._sync_all_params()
+
+    def _save_settings_to_file(self) -> None:
+        """현재 세팅을 JSON 파일로 저장."""
+        default_path = str(self._settings_default_path())
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            self._t("dialog_save_settings"),
+            default_path,
+            self._t("filter_json"),
+        )
+        if not target:
+            return
+        save_path = Path(target).expanduser()
+        if save_path.suffix.lower() != ".json":
+            save_path = save_path.with_suffix(".json")
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = self._collect_settings_payload()
+        try:
+            with open(save_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            QMessageBox.critical(self, self._t("dialog_settings_error"), str(exc))
+            return
+
+        self.record_status.setText(self._t("status_settings_saved", path=save_path))
+
+    def _load_settings_from_file(self) -> None:
+        """JSON 세팅 파일을 로드해 현재 UI에 적용."""
+        default_path = str(self._settings_default_path())
+        target, _ = QFileDialog.getOpenFileName(
+            self,
+            self._t("dialog_load_settings"),
+            default_path,
+            self._t("filter_json"),
+        )
+        if not target:
+            return
+        load_path = Path(target).expanduser()
+        try:
+            with open(load_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self._apply_settings_payload(payload)
+        except Exception as exc:
+            QMessageBox.critical(self, self._t("dialog_settings_error"), str(exc))
+            return
+
+        self.record_status.setText(self._t("status_settings_loaded", path=load_path))
+
+    def _apply_selected_preset(self) -> None:
+        """선택한 내장 프리셋을 현재 세팅에 반영."""
+        preset_key = self.preset_combo.currentData()
+        if not isinstance(preset_key, str) or preset_key == "custom":
+            return
+        values = self.PRESET_VALUES.get(preset_key)
+        if values is None:
+            return
+        self._apply_slider_settings(values)
+        self._sync_all_params()
+        self.record_status.setText(
+            self._t("status_preset_applied", name=self.preset_combo.currentText())
+        )
+
+    def _reset_to_defaults(self) -> None:
+        """입출력 게인 제외 전체 0 기본값으로 복원."""
+        default_values = {
+            "input_gain": 100,
+            "output_gain": 100,
+            "distortion": 0,
+            "reverb": 0,
+            "delay_mix": 0,
+            "delay_time": 0,
+            "delay_feedback": 0,
+            "echo_mix": 0,
+            "echo_time": 0,
+            "echo_feedback": 0,
+        }
+        self._apply_slider_settings(default_values)
+        custom_index = self.preset_combo.findData("custom")
+        if custom_index >= 0:
+            self.preset_combo.setCurrentIndex(custom_index)
+        self._sync_all_params()
+        self.record_status.setText(self._t("status_settings_reset"))
+
+    def _set_icon_button(
+        self,
+        button: QPushButton,
+        icon_type: QStyle.StandardPixmap,
+        text: str,
+    ) -> None:
+        """아이콘 + 텍스트 버튼 공통 스타일."""
+        button.setIcon(self.style().standardIcon(icon_type))
+        button.setText(text)
+        button.setToolTip(text)
+        button.setStatusTip(text)
+        button.setMinimumHeight(32)
+
+    @staticmethod
+    def _create_shape_icon(shape: str, color: str) -> QIcon:
+        """단색 도형 아이콘(원/사각형)을 생성."""
+        pixmap = QPixmap(18, 18)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        if shape == "circle":
+            painter.drawEllipse(2, 2, 14, 14)
+        else:
+            painter.drawRect(3, 3, 12, 12)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _set_record_button_sizes(self) -> None:
+        """녹음/재생 컨트롤 버튼 크기를 동일하게 고정."""
+        for button in (
+            self.rec_start_btn,
+            self.rec_stop_btn,
+            self.play_btn,
+            self.stop_playback_btn,
+        ):
+            button.setMinimumWidth(116)
+            button.setMaximumWidth(116)
+            button.setMinimumHeight(34)
+
+    def _refresh_stream_toggle_button(self, force: bool = False) -> None:
+        """현재 처리 상태에 따라 시작 버튼의 아이콘/문구를 토글."""
+        is_running = self.engine.is_running()
+        if (not force) and self.stream_button_running_state == is_running:
+            return
+        self.stream_button_running_state = is_running
+
+        if is_running:
+            self.start_btn.setIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+            )
+            self.start_btn.setText(self._t("btn_stop_processing"))
+            self.start_btn.setToolTip(self._t("btn_stop_processing"))
+            self.start_btn.setStatusTip(self._t("btn_stop_processing"))
+        else:
+            self.start_btn.setIcon(
+                self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+            )
+            self.start_btn.setText(self._t("btn_start_processing"))
+            self.start_btn.setToolTip(self._t("btn_start_processing"))
+            self.start_btn.setStatusTip(self._t("btn_start_processing"))
+
+        # 상단 주요 버튼(장치 새로고침/처리 시작)의 크기를 동일하게 고정
+        self.refresh_btn.setMinimumWidth(132)
+        self.refresh_btn.setMaximumWidth(132)
+        self.refresh_btn.setMinimumHeight(34)
+        self.start_btn.setMinimumWidth(132)
+        self.start_btn.setMaximumWidth(132)
+        self.start_btn.setMinimumHeight(34)
+
+    def _apply_theme(self) -> None:
+        """현재 선택한 다크/라이트 테마를 앱 전체에 적용."""
+        if self.current_theme == "dark":
+            colors = {
+                "window_bg": "#111827",
+                "text": "#e5e7eb",
+                "card_bg": "#1f2937",
+                "card_border": "#374151",
+                "title": "#93c5fd",
+                "accent": "#60a5fa",
+                "accent_hover": "#3b82f6",
+                "accent_pressed": "#2563eb",
+                "disabled_bg": "#4b5563",
+                "disabled_fg": "#9ca3af",
+                "input_bg": "#111827",
+                "input_border": "#4b5563",
+                "combo_popup_bg": "#1f2937",
+                "combo_popup_sel": "#2563eb",
+                "slider_track": "#334155",
+                "slider_fill": "#60a5fa",
+                "slider_handle_border": "#93c5fd",
+                "tab_bg": "#243244",
+                "tab_text": "#c8d7ea",
+                "tab_hover": "#334155",
+                "status_bg": "#0f2740",
+                "status_fg": "#93c5fd",
+                "status_border": "#375a7f",
+                "plot_bg": "#111827",
+                "plot_fg": "#cbd5e1",
+                "live_color": "#34d399",
+                "recorded_color": "#60a5fa",
+                "cursor_color": "#f59e0b",
+            }
+        else:
+            colors = {
+                "window_bg": "#f3f6fb",
+                "text": "#1f2a37",
+                "card_bg": "#ffffff",
+                "card_border": "#d4deea",
+                "title": "#27435f",
+                "accent": "#2a7bd5",
+                "accent_hover": "#1f6dbe",
+                "accent_pressed": "#185796",
+                "disabled_bg": "#bcc8d8",
+                "disabled_fg": "#eef3f9",
+                "input_bg": "#fbfdff",
+                "input_border": "#c7d3e2",
+                "combo_popup_bg": "#ffffff",
+                "combo_popup_sel": "#2a7bd5",
+                "slider_track": "#d8e1ed",
+                "slider_fill": "#2a7bd5",
+                "slider_handle_border": "#165491",
+                "tab_bg": "#e7eef7",
+                "tab_text": "#35506b",
+                "tab_hover": "#dfe9f6",
+                "status_bg": "#edf4ff",
+                "status_fg": "#1e4f80",
+                "status_border": "#c8daf1",
+                "plot_bg": "#fbfdff",
+                "plot_fg": "#344861",
+                "live_color": "#3f9f5f",
+                "recorded_color": "#2f5fa0",
+                "cursor_color": "#ff8a00",
+            }
+
+        self.setStyleSheet(
+            f"""
+            QMainWindow {{
+                background: {colors["window_bg"]};
+            }}
+            QWidget {{
+                color: {colors["text"]};
+                font-family: "Segoe UI", "Noto Sans KR";
+                font-size: 10pt;
+            }}
+            QGroupBox {{
+                background: {colors["card_bg"]};
+                border: 1px solid {colors["card_border"]};
+                border-radius: 12px;
+                margin-top: 12px;
+                font-weight: 600;
+                padding: 8px 10px 10px 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 4px;
+                color: {colors["title"]};
+            }}
+            QPushButton {{
+                background: {colors["accent"]};
+                color: #ffffff;
+                border: none;
+                border-radius: 8px;
+                padding: 6px 12px;
+                min-height: 28px;
+            }}
+            QPushButton:hover {{
+                background: {colors["accent_hover"]};
+            }}
+            QPushButton:pressed {{
+                background: {colors["accent_pressed"]};
+            }}
+            QPushButton:disabled {{
+                background: {colors["disabled_bg"]};
+                color: {colors["disabled_fg"]};
+            }}
+            QPushButton#themeToggle {{
+                background: {colors["input_bg"]};
+                border: 1px solid {colors["input_border"]};
+                border-radius: 8px;
+                min-width: 36px;
+                max-width: 36px;
+                min-height: 36px;
+                max-height: 36px;
+                padding: 0px;
+            }}
+            QPushButton#themeToggle:hover {{
+                background: {colors["tab_hover"]};
+            }}
+            QPushButton#themeToggle:pressed {{
+                background: {colors["card_border"]};
+            }}
+            QLineEdit, QComboBox {{
+                background: {colors["input_bg"]};
+                color: {colors["text"]};
+                border: 1px solid {colors["input_border"]};
+                border-radius: 8px;
+                padding: 4px 8px;
+                min-height: 28px;
+                selection-background-color: {colors["accent"]};
+                selection-color: #ffffff;
+            }}
+            QComboBox::drop-down {{
+                width: 24px;
+                border: 0px;
+                border-left: 1px solid {colors["input_border"]};
+                background: {colors["card_border"]};
+                border-top-right-radius: 8px;
+                border-bottom-right-radius: 8px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {colors["combo_popup_bg"]};
+                color: {colors["text"]};
+                border: 1px solid {colors["input_border"]};
+                selection-background-color: {colors["combo_popup_sel"]};
+                selection-color: #ffffff;
+                outline: 0;
+            }}
+            QSlider::groove:horizontal {{
+                border: none;
+                height: 10px;
+                background: {colors["slider_track"]};
+                border-radius: 5px;
+            }}
+            QSlider::sub-page:horizontal {{
+                height: 10px;
+                background: {colors["slider_fill"]};
+                border-radius: 5px;
+            }}
+            QSlider::add-page:horizontal {{
+                height: 10px;
+                background: {colors["slider_track"]};
+                border-radius: 5px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {colors["slider_fill"]};
+                border: 1px solid {colors["slider_handle_border"]};
+                width: 18px;
+                margin: -7px 0;
+                border-radius: 9px;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {colors["card_border"]};
+                border-radius: 12px;
+                background: {colors["card_bg"]};
+                top: -1px;
+            }}
+            QTabBar::tab {{
+                background: {colors["tab_bg"]};
+                color: {colors["tab_text"]};
+                border: 1px solid {colors["card_border"]};
+                border-bottom: none;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+                min-width: 130px;
+                padding: 8px 14px;
+                margin-right: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background: {colors["accent"]};
+                color: #ffffff;
+                border-color: {colors["accent"]};
+            }}
+            QTabBar::tab:!selected:hover {{
+                background: {colors["tab_hover"]};
+            }}
+            QLabel#statusPill {{
+                background: {colors["status_bg"]};
+                color: {colors["status_fg"]};
+                border: 1px solid {colors["status_border"]};
+                border-radius: 8px;
+                padding: 5px 10px;
+                font-weight: 600;
+            }}
+            """
+        )
+
+        pg.setConfigOption("background", colors["plot_bg"])
+        pg.setConfigOption("foreground", colors["plot_fg"])
+        if hasattr(self, "live_plot") and hasattr(self, "recorded_plot"):
+            self.live_plot.setBackground(colors["plot_bg"])
+            self.recorded_plot.setBackground(colors["plot_bg"])
+            axis_pen = pg.mkPen(colors["plot_fg"], width=1)
+            for plot_widget in (self.live_plot, self.recorded_plot):
+                for axis_name in ("bottom", "left"):
+                    axis = plot_widget.getAxis(axis_name)
+                    axis.setPen(axis_pen)
+                    axis.setTextPen(axis_pen)
+            if hasattr(self, "live_curve"):
+                self.live_curve.setPen(pg.mkPen(colors["live_color"], width=1.8))
+            if hasattr(self, "recorded_curve"):
+                self.recorded_curve.setPen(
+                    pg.mkPen(colors["recorded_color"], width=1.3)
+                )
+            if hasattr(self, "playback_cursor"):
+                self.playback_cursor.setPen(pg.mkPen(colors["cursor_color"], width=2))
+        self._refresh_theme_toggle_button()
+
     # -------- UI 구성 --------
     def _build_ui(self) -> None:
         """장치/이펙트/파형/녹음 UI를 생성하고 시그널을 연결"""
         root = QWidget()
         root_layout = QVBoxLayout(root)
-        root_layout.setSpacing(10)
+        root_layout.setSpacing(12)
+        root_layout.setContentsMargins(14, 14, 14, 14)
 
-        # 1) 장치/언어/처리 시작-중지 제어 영역
+        # 1) 장치/언어/처리 시작-중지 영역
         self.device_group = QGroupBox()
         device_layout = QGridLayout(self.device_group)
+        device_layout.setHorizontalSpacing(10)
+        device_layout.setVerticalSpacing(8)
         self.input_label = QLabel()
         self.output_label = QLabel()
         self.language_label = QLabel()
@@ -637,11 +1320,22 @@ class MainWindow(QMainWindow):
         self.refresh_btn = QPushButton()
         self.refresh_btn.clicked.connect(self._load_devices)
         self.start_btn = QPushButton()
-        self.start_btn.clicked.connect(self._start_stream)
+        self.start_btn.clicked.connect(self._toggle_stream)
         self.stop_btn = QPushButton()
         self.stop_btn.clicked.connect(self._stop_stream)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.hide()
         self.stream_label = QLabel()
+        self.stream_label.setObjectName("statusPill")
+        self.stream_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.stream_label.setMinimumWidth(150)
+        self.stream_label.setMaximumWidth(150)
+        self.theme_toggle_btn = QPushButton()
+        self.theme_toggle_btn.setObjectName("themeToggle")
+        self.theme_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.theme_toggle_btn.setFixedSize(36, 36)
+        self.theme_toggle_btn.setIconSize(QSize(20, 20))
+        self.theme_toggle_btn.clicked.connect(self._toggle_theme)
 
         device_layout.addWidget(self.input_label, 0, 0)
         device_layout.addWidget(self.input_combo, 0, 1)
@@ -652,14 +1346,60 @@ class MainWindow(QMainWindow):
         device_layout.addWidget(self.process_end_mode_label, 3, 0)
         device_layout.addWidget(self.process_end_mode_combo, 3, 1)
         device_layout.addWidget(self.refresh_btn, 0, 2)
-        device_layout.addWidget(self.start_btn, 1, 2)
-        device_layout.addWidget(self.stop_btn, 1, 3)
-        device_layout.addWidget(self.stream_label, 0, 3)
-        root_layout.addWidget(self.device_group)
+        device_layout.addWidget(self.start_btn, 1, 2, 1, 2)
+        device_layout.addWidget(self.stream_label, 0, 4, 2, 1)
+        device_layout.addWidget(
+            self.theme_toggle_btn,
+            3,
+            4,
+            1,
+            1,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+        )
+        device_layout.setColumnStretch(1, 1)
 
-        # 2) 이펙트 및 게인 조절 영역
+        # 2) 프리셋/세팅 저장-불러오기 영역
+        self.presets_group = QGroupBox()
+        presets_layout = QGridLayout(self.presets_group)
+        presets_layout.setHorizontalSpacing(10)
+        presets_layout.setVerticalSpacing(8)
+        self.preset_label = QLabel()
+        self.preset_combo = QComboBox()
+        self._rebuild_preset_combo()
+        self.apply_preset_btn = QPushButton()
+        self.apply_preset_btn.clicked.connect(self._apply_selected_preset)
+        self.save_settings_btn = QPushButton()
+        self.save_settings_btn.clicked.connect(self._save_settings_to_file)
+        self.load_settings_btn = QPushButton()
+        self.load_settings_btn.clicked.connect(self._load_settings_from_file)
+        self.reset_defaults_btn = QPushButton()
+        self.reset_defaults_btn.clicked.connect(self._reset_to_defaults)
+
+        presets_layout.addWidget(self.preset_label, 0, 0)
+        presets_layout.addWidget(self.preset_combo, 0, 1, 1, 2)
+        presets_layout.addWidget(self.apply_preset_btn, 0, 3)
+        presets_layout.addWidget(self.save_settings_btn, 0, 4)
+        presets_layout.addWidget(self.load_settings_btn, 0, 5)
+        presets_layout.addWidget(self.reset_defaults_btn, 0, 6)
+        presets_layout.setColumnStretch(2, 1)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+        top_row.addWidget(self.device_group, 3)
+        top_row.addWidget(self.presets_group, 2)
+        root_layout.addLayout(top_row)
+
+        self.main_tabs = QTabWidget()
+
+        # 3) 이펙트 탭
+        self.effects_tab = QWidget()
+        effects_tab_layout = QVBoxLayout(self.effects_tab)
+        effects_tab_layout.setContentsMargins(8, 8, 8, 8)
+        effects_tab_layout.setSpacing(8)
         self.effects_group = QGroupBox()
         effects_layout = QGridLayout(self.effects_group)
+        effects_layout.setHorizontalSpacing(12)
+        effects_layout.setVerticalSpacing(8)
         row = 0
         self.input_gain_slider = self._add_slider(
             effects_layout,
@@ -687,11 +1427,12 @@ class MainWindow(QMainWindow):
             effects_layout,
             row,
             "slider_distortion_drive",
-            100,
-            800,
-            100,
-            lambda v: f"{v / 100.0:.2f}x",
-            lambda v: self.engine.set_param("distortion_drive", v / 100.0),
+            0,
+            700,
+            0,
+            lambda v: f"{1.0 + (v / 100.0):.2f}x",
+            lambda v: self.engine.set_param("distortion_drive", 1.0 + (v / 100.0)),
+            text_to_value=self._parse_distortion_input_value,
         )
         row += 1
         self.reverb_slider = self._add_slider(
@@ -720,9 +1461,9 @@ class MainWindow(QMainWindow):
             effects_layout,
             row,
             "slider_delay_time",
-            20,
+            0,
             1500,
-            280,
+            0,
             lambda v: f"{v} ms",
             lambda v: self.engine.set_param("delay_time_ms", float(v)),
         )
@@ -733,7 +1474,7 @@ class MainWindow(QMainWindow):
             "slider_delay_feedback",
             0,
             95,
-            35,
+            0,
             lambda v: f"{v}%",
             lambda v: self.engine.set_param("delay_feedback", v / 100.0),
         )
@@ -753,9 +1494,9 @@ class MainWindow(QMainWindow):
             effects_layout,
             row,
             "slider_echo_time",
-            100,
+            0,
             2500,
-            150,
+            0,
             lambda v: f"{v} ms",
             lambda v: self.engine.set_param("echo_time_ms", float(v)),
         )
@@ -766,50 +1507,24 @@ class MainWindow(QMainWindow):
             "slider_echo_feedback",
             0,
             95,
-            30,
+            0,
             lambda v: f"{v}%",
             lambda v: self.engine.set_param("echo_feedback", v / 100.0),
         )
-        root_layout.addWidget(self.effects_group)
+        effects_layout.setColumnStretch(1, 1)
+        effects_tab_layout.addWidget(self.effects_group)
+        self.main_tabs.addTab(self.effects_tab, "")
 
-        # 3) 실시간/녹음 파형 표시 영역
-        self.plot_group = QGroupBox()
-        plot_layout = QVBoxLayout(self.plot_group)
-        self.live_plot = pg.PlotWidget()
-        self.live_plot.setYRange(-2.0, 2.0)
-        self.live_plot.showGrid(x=True, y=True, alpha=0.22)
-        self.live_plot.setMinimumHeight(150)
-        self.live_plot.setMouseEnabled(x=False, y=False)
-        self.live_plot.setMenuEnabled(False)
-        self.live_curve = self.live_plot.plot(pen=pg.mkPen(color="#3f9f5f", width=1.5))
+        # 4) 스튜디오 탭 (좌: 녹음/재생, 우: 파형 1:3)
+        self.studio_tab = QWidget()
+        studio_layout = QHBoxLayout(self.studio_tab)
+        studio_layout.setContentsMargins(8, 8, 8, 8)
+        studio_layout.setSpacing(10)
 
-        self.recorded_plot = pg.PlotWidget()
-        self.recorded_plot.setYRange(-2.0, 2.0)
-        self.recorded_plot.showGrid(x=True, y=True, alpha=0.22)
-        self.recorded_plot.setMinimumHeight(300)
-        self.recorded_plot.setMouseEnabled(x=False, y=False)
-        self.recorded_plot.setMenuEnabled(False)
-        self.recorded_curve = self.recorded_plot.plot(
-            pen=pg.mkPen(color="#2f5fa0", width=1.2)
-        )
-        self.playback_cursor = pg.InfiniteLine(
-            pos=0.0, angle=90, movable=True, pen=pg.mkPen("#ff8a00", width=2)
-        )
-        self.playback_cursor.setBounds((0.0, 1.0))
-        self.playback_cursor.setZValue(10)
-        self.playback_cursor.sigPositionChanged.connect(self._on_playback_cursor_moved)
-        self.recorded_plot.addItem(self.playback_cursor)
-        self.playback_cursor.hide()
-
-        plot_layout.addWidget(self.live_plot)
-        plot_layout.addWidget(self.recorded_plot)
-        plot_layout.setStretch(0, 1)
-        plot_layout.setStretch(1, 3)
-        root_layout.addWidget(self.plot_group, 2)
-
-        # 4) 녹음/저장/재생 및 모니터링 모드 영역
         self.rec_group = QGroupBox()
         rec_layout = QGridLayout(self.rec_group)
+        rec_layout.setHorizontalSpacing(10)
+        rec_layout.setVerticalSpacing(8)
         self.save_path_label = QLabel()
         self.path_edit = QLineEdit()
         self.path_edit.setText(str(Path.cwd() / "recording.wav"))
@@ -824,7 +1539,6 @@ class MainWindow(QMainWindow):
         self.record_mode_combo.currentIndexChanged.connect(
             self._on_record_output_mode_changed
         )
-        # UI 기본 선택  "녹음 중 무음"
         self.record_mode_combo.setCurrentIndex(1)
         self.engine.set_record_output_mode(self._get_selected_record_output_mode())
 
@@ -838,8 +1552,10 @@ class MainWindow(QMainWindow):
         self.stop_playback_btn = QPushButton()
         self.stop_playback_btn.clicked.connect(self._stop_playback_to_start)
         self.stop_playback_btn.setEnabled(False)
+        self._set_record_button_sizes()
 
         self.record_status = QLabel()
+        self.record_status.setObjectName("statusPill")
         self.routing_hint = QLabel()
 
         rec_layout.addWidget(self.save_path_label, 0, 0)
@@ -854,7 +1570,58 @@ class MainWindow(QMainWindow):
         rec_layout.addWidget(self.record_mode_combo, 2, 1, 1, 3)
         rec_layout.addWidget(self.record_status, 3, 1, 1, 4)
         rec_layout.addWidget(self.routing_hint, 4, 1, 1, 4)
-        root_layout.addWidget(self.rec_group)
+        rec_layout.setColumnStretch(1, 1)
+
+        self.plot_group = QGroupBox()
+        plot_layout = QVBoxLayout(self.plot_group)
+        plot_layout.setSpacing(10)
+        self.live_plot = pg.PlotWidget()
+        self.live_plot.setYRange(-2.0, 2.0)
+        self.live_plot.showGrid(x=True, y=True, alpha=0.22)
+        self.live_plot.setMinimumHeight(160)
+        self.live_plot.setMouseEnabled(x=False, y=False)
+        self.live_plot.setMenuEnabled(False)
+        live_item = self.live_plot.getPlotItem()
+        live_item.hideButtons()
+        live_item.setClipToView(True)
+        live_item.setDownsampling(auto=True, mode="peak")
+        self.live_curve = self.live_plot.plot(pen=pg.mkPen(color="#3f9f5f", width=1.5))
+
+        self.recorded_plot = pg.PlotWidget()
+        self.recorded_plot.setYRange(-2.0, 2.0)
+        self.recorded_plot.showGrid(x=True, y=True, alpha=0.22)
+        self.recorded_plot.setMinimumHeight(340)
+        self.recorded_plot.setMouseEnabled(x=False, y=False)
+        self.recorded_plot.setMenuEnabled(False)
+        recorded_item = self.recorded_plot.getPlotItem()
+        recorded_item.hideButtons()
+        recorded_item.setClipToView(True)
+        recorded_item.setDownsampling(auto=True, mode="peak")
+        self.recorded_curve = self.recorded_plot.plot(
+            pen=pg.mkPen(color="#2f5fa0", width=1.2)
+        )
+        self.playback_cursor = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=True, pen=pg.mkPen("#ff8a00", width=2)
+        )
+        self.playback_cursor.setBounds((0.0, 1.0))
+        self.playback_cursor.setZValue(10)
+        # 드래그 중 연속 seek 대신 드래그 완료 시점에만 seek 적용
+        self.playback_cursor.sigPositionChangeFinished.connect(
+            self._on_playback_cursor_moved
+        )
+        self.recorded_plot.addItem(self.playback_cursor)
+        self.playback_cursor.hide()
+
+        plot_layout.addWidget(self.live_plot)
+        plot_layout.addWidget(self.recorded_plot)
+        plot_layout.setStretch(0, 1)
+        plot_layout.setStretch(1, 3)
+
+        studio_layout.addWidget(self.rec_group, 1)
+        studio_layout.addWidget(self.plot_group, 3)
+        self.main_tabs.addTab(self.studio_tab, "")
+
+        root_layout.addWidget(self.main_tabs, 1)
 
         self.setCentralWidget(root)
 
@@ -862,9 +1629,12 @@ class MainWindow(QMainWindow):
         """현재 언어 기준으로 버튼, 라벨, 플롯 타이틀을 일괄 갱신"""
         self.setWindowTitle(self._t("window_title"))
         self.device_group.setTitle(self._t("group_audio_devices"))
+        self.presets_group.setTitle(self._t("group_presets_settings"))
         self.effects_group.setTitle(self._t("group_effects_gain"))
         self.plot_group.setTitle(self._t("group_waveforms"))
         self.rec_group.setTitle(self._t("group_recording"))
+        self.main_tabs.setTabText(0, self._t("tab_effects"))
+        self.main_tabs.setTabText(1, self._t("tab_studio"))
 
         self.input_label.setText(self._t("label_input_mic"))
         self.output_label.setText(self._t("label_output_speaker"))
@@ -873,8 +1643,15 @@ class MainWindow(QMainWindow):
         self.process_end_mode_combo.setItemText(0, self._t("process_end_mode_auto"))
         self.process_end_mode_combo.setItemText(1, self._t("process_end_mode_manual"))
         self.refresh_btn.setText(self._t("btn_refresh_devices"))
-        self.start_btn.setText(self._t("btn_start_processing"))
-        self.stop_btn.setText(self._t("btn_stop_processing"))
+        self._refresh_stream_toggle_button(force=True)
+        self._refresh_theme_toggle_button()
+
+        self.preset_label.setText(self._t("label_preset"))
+        self._rebuild_preset_combo()
+        self.apply_preset_btn.setText(self._t("btn_apply_preset"))
+        self.save_settings_btn.setText(self._t("btn_save_settings"))
+        self.load_settings_btn.setText(self._t("btn_load_settings"))
+        self.reset_defaults_btn.setText(self._t("btn_reset_defaults"))
 
         self.live_plot.setTitle(self._t("plot_live_title"))
         self.recorded_plot.setTitle(self._t("plot_recorded_title"))
@@ -888,10 +1665,28 @@ class MainWindow(QMainWindow):
         self.record_mode_combo.setItemText(
             1, self._t("record_output_mode_mute_while_recording")
         )
-        self.rec_start_btn.setText(self._t("btn_start_recording"))
-        self.rec_stop_btn.setText(self._t("btn_stop_and_save"))
-        self.stop_playback_btn.setText(self._t("btn_stop_playback"))
+        rec_start_text = "시작" if self.current_language == "ko" else "Start"
+        rec_stop_text = "정지" if self.current_language == "ko" else "Stop"
+        self._set_icon_button(
+            self.rec_start_btn,
+            QStyle.StandardPixmap.SP_DialogApplyButton,
+            rec_start_text,
+        )
+        self.rec_start_btn.setIcon(self._create_shape_icon("circle", "#ef4444"))
+        self._set_icon_button(
+            self.rec_stop_btn,
+            QStyle.StandardPixmap.SP_DialogSaveButton,
+            rec_stop_text,
+        )
+        self.rec_stop_btn.setIcon(self._create_shape_icon("square", "#ef4444"))
+        self._set_icon_button(
+            self.stop_playback_btn,
+            QStyle.StandardPixmap.SP_MediaStop,
+            self._t("btn_stop_playback"),
+        )
+        self._set_record_button_sizes()
         self.routing_hint.setText(self._t("hint_virtual_routing"))
+        self._refresh_device_unassigned_label()
 
         for key, label in self.slider_title_labels.items():
             label.setText(self._t(key))
@@ -912,7 +1707,7 @@ class MainWindow(QMainWindow):
         else:
             self.stream_label.setText(self._t("status_stopped"))
 
-        self._refresh_playback_buttons()
+        self._refresh_playback_buttons(force=True)
 
     def _add_slider(
         self,
@@ -924,23 +1719,90 @@ class MainWindow(QMainWindow):
         initial: int,
         value_to_text,
         on_value_changed,
+        text_to_value=None,
     ) -> QSlider:
-        """공통 슬라이더 행(라벨/슬라이더/값 표시)을 생성해 레이아웃에 추가"""
+        """공통 슬라이더 행(라벨/슬라이더/입력 가능 값 필드)을 생성."""
         label = QLabel(self._t(title_key))
         self.slider_title_labels[title_key] = label
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(minimum, maximum)
         slider.setValue(initial)
-        value_label = QLabel(value_to_text(initial))
-        value_label.setMinimumWidth(70)
+        value_edit = QLineEdit(value_to_text(initial))
+        value_edit.setMinimumWidth(84)
+        value_edit.setMaximumWidth(100)
+        value_edit.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
 
-        slider.valueChanged.connect(lambda v: value_label.setText(value_to_text(v)))
+        def _sync_value_text(v: int) -> None:
+            if not value_edit.hasFocus():
+                value_edit.setText(value_to_text(v))
+
+        slider.valueChanged.connect(_sync_value_text)
         slider.valueChanged.connect(on_value_changed)
+
+        def _apply_input_text() -> None:
+            parsed_value = self._parse_slider_input_value(
+                text=value_edit.text(),
+                current_value=slider.value(),
+                slider=slider,
+                text_to_value=text_to_value,
+            )
+            slider.setValue(parsed_value)
+            value_edit.setText(value_to_text(slider.value()))
+
+        value_edit.editingFinished.connect(_apply_input_text)
 
         layout.addWidget(label, row, 0)
         layout.addWidget(slider, row, 1)
-        layout.addWidget(value_label, row, 2)
+        layout.addWidget(value_edit, row, 2)
         return slider
+
+    @staticmethod
+    def _extract_number(text: str) -> Optional[float]:
+        """문자열에서 첫 번째 숫자 토큰을 추출."""
+        if not text:
+            return None
+        match = re.search(r"[-+]?\d*\.?\d+", text.replace(",", "."))
+        if not match:
+            return None
+        try:
+            return float(match.group(0))
+        except Exception:
+            return None
+
+    def _parse_slider_input_value(
+        self,
+        text: str,
+        current_value: int,
+        slider: QSlider,
+        text_to_value=None,
+    ) -> int:
+        """값 입력 필드 문자열을 슬라이더 정수 값으로 파싱/보정."""
+        parsed: Optional[float] = None
+        if text_to_value is not None:
+            try:
+                parsed = float(text_to_value(text))
+            except Exception:
+                parsed = None
+
+        if parsed is None:
+            parsed = self._extract_number(text)
+        if parsed is None:
+            return int(np.clip(current_value, slider.minimum(), slider.maximum()))
+
+        as_int = int(round(parsed))
+        return int(np.clip(as_int, slider.minimum(), slider.maximum()))
+
+    def _parse_distortion_input_value(self, text: str) -> int:
+        """디스토션 입력값 파싱: 1.50x 또는 150 같은 입력을 모두 허용."""
+        value = self._extract_number(text)
+        if value is None:
+            raise ValueError("invalid number")
+        normalized = text.lower().strip()
+        if "x" in normalized or value <= 8.0:
+            return int(round((value - 1.0) * 100.0))
+        return int(round(value))
 
     # -------- 파라미터/장치 동기화 --------
     def _sync_all_params(self) -> None:
@@ -948,7 +1810,7 @@ class MainWindow(QMainWindow):
         self.engine.set_param("input_gain", self.input_gain_slider.value() / 100.0)
         self.engine.set_param("output_gain", self.output_gain_slider.value() / 100.0)
         self.engine.set_param(
-            "distortion_drive", self.distortion_slider.value() / 100.0
+            "distortion_drive", 1.0 + (self.distortion_slider.value() / 100.0)
         )
         self.engine.set_param("reverb_wet", self.reverb_slider.value() / 100.0)
         self.engine.set_param("delay_wet", self.delay_mix_slider.value() / 100.0)
@@ -969,6 +1831,8 @@ class MainWindow(QMainWindow):
 
         self.input_combo.clear()
         self.output_combo.clear()
+        self.input_combo.addItem(self._t("device_unassigned"), None)
+        self.output_combo.addItem(self._t("device_unassigned"), None)
 
         try:
             inputs, outputs = self.engine.list_devices()
@@ -1000,6 +1864,13 @@ class MainWindow(QMainWindow):
         if combo.count() > 0:
             combo.setCurrentIndex(0)
 
+    def _refresh_device_unassigned_label(self) -> None:
+        """장치 콤보의 미할당 항목 텍스트를 현재 언어로 갱신."""
+        for combo in (self.input_combo, self.output_combo):
+            idx = combo.findData(None)
+            if idx >= 0:
+                combo.setItemText(idx, self._t("device_unassigned"))
+
     # -------- 스트림/녹음/재생 제어 --------
     @staticmethod
     def _normalize_record_file_path(path: Path) -> Path:
@@ -1030,7 +1901,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             raise RuntimeError(self._t("msg_m4a_dep_missing")) from exc
 
-    def _save_audio_file(self, save_path: Path, audio: np.ndarray, samplerate: int) -> None:
+    def _save_audio_file(
+        self, save_path: Path, audio: np.ndarray, samplerate: int
+    ) -> None:
         """선택된 확장자에 맞춰 WAV 또는 M4A로 저장한다."""
         suffix = save_path.suffix.lower()
         if suffix == ".m4a":
@@ -1165,24 +2038,45 @@ class MainWindow(QMainWindow):
             return maybe_path
         return None
 
-    def _refresh_playback_buttons(self) -> None:
-        """재생/일시정지 토글 텍스트와 정지 버튼 활성 상태를 갱신한다."""
-        if self.engine.is_running():
+    def _refresh_playback_buttons(self, force: bool = False) -> None:
+        """재생/일시정지 아이콘과 정지 버튼 활성 상태를 갱신한다."""
+        engine_running = self.engine.is_running()
+        if engine_running:
+            signature = (True, False, False, self.current_language)
+            if (not force) and self.playback_button_signature == signature:
+                return
+            self.playback_button_signature = signature
             self.play_btn.setEnabled(False)
             self.stop_playback_btn.setEnabled(False)
-            self.play_btn.setText(self._t("btn_play_pause_play"))
+            self._set_icon_button(
+                self.play_btn,
+                QStyle.StandardPixmap.SP_MediaPlay,
+                self._t("btn_play_pause_play"),
+            )
             return
 
         is_running = self._is_playback_running()
-        self.play_btn.setEnabled(True)
-        if is_running:
-            self.play_btn.setText(self._t("btn_play_pause_pause"))
-        else:
-            self.play_btn.setText(self._t("btn_play_pause_play"))
-
         with self.playback_lock:
             has_position = (
                 self.playback_total_frames > 0 and self.playback_current_frame > 0
+            )
+        signature = (False, bool(is_running), bool(has_position), self.current_language)
+        if (not force) and self.playback_button_signature == signature:
+            return
+        self.playback_button_signature = signature
+
+        self.play_btn.setEnabled(True)
+        if is_running:
+            self._set_icon_button(
+                self.play_btn,
+                QStyle.StandardPixmap.SP_MediaPause,
+                self._t("btn_play_pause_pause"),
+            )
+        else:
+            self._set_icon_button(
+                self.play_btn,
+                QStyle.StandardPixmap.SP_MediaPlay,
+                self._t("btn_play_pause_play"),
             )
         self.stop_playback_btn.setEnabled(is_running or has_position)
 
@@ -1303,6 +2197,8 @@ class MainWindow(QMainWindow):
 
     def _sync_playback_cursor_line(self) -> None:
         """재생 중 현재 프레임을 파형 위 세로 막대(|)로 동기화한다."""
+        if not self._is_playback_running():
+            return
         with self.playback_lock:
             total = self.playback_total_frames
             frame = self.playback_current_frame
@@ -1312,6 +2208,9 @@ class MainWindow(QMainWindow):
             return
 
         frame = int(np.clip(frame, 0, total))
+        if frame == self.last_cursor_frame_synced:
+            return
+        self.last_cursor_frame_synced = frame
         seconds = frame / float(samplerate)
         self._set_playback_cursor_seconds(seconds)
 
@@ -1336,8 +2235,8 @@ class MainWindow(QMainWindow):
             return
 
         self.stream_label.setText(self._t("status_running_sr", samplerate=samplerate))
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self.stream_expected_running = True
+        self._refresh_stream_toggle_button()
         self._refresh_playback_buttons()
 
     def _stop_stream(self) -> None:
@@ -1346,9 +2245,9 @@ class MainWindow(QMainWindow):
             self.engine.stop()
         except Exception as exc:
             QMessageBox.warning(self, self._t("dialog_audio_stop_warning"), str(exc))
+        self.stream_expected_running = False
         self.stream_label.setText(self._t("status_stopped"))
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self._refresh_stream_toggle_button()
         self.rec_start_btn.setEnabled(True)
         self.rec_stop_btn.setEnabled(False)
         self._refresh_playback_buttons()
@@ -1525,6 +2424,7 @@ class MainWindow(QMainWindow):
             self.playback_stream = sd.OutputStream(
                 samplerate=samplerate,
                 blocksize=self.engine.block_size,
+                latency="high",
                 device=int(output_dev),
                 channels=channels,
                 dtype="float32",
@@ -1542,10 +2442,23 @@ class MainWindow(QMainWindow):
     # -------- 실시간 표시/종료 처리 --------
     def _update_live_waveform(self) -> None:
         """타이머 주기로 실시간 파형/스트림 상태를 갱신"""
-        samples = self.engine.get_latest_output()
-        if samples.size > 0:
-            self.live_curve.setData(samples)
-        self._sync_playback_cursor_line()
+        studio_visible = (
+            hasattr(self, "main_tabs")
+            and self.main_tabs.currentIndex() == 1
+            and self.isVisible()
+            and self.isActiveWindow()
+        )
+        if studio_visible:
+            if self.engine.is_running():
+                samples = self.engine.get_latest_output()
+                if samples.size > 0:
+                    self.live_curve.setData(samples)
+                    self.live_wave_visible = True
+            elif self.live_wave_visible:
+                # 스트림 중지 상태에서는 실시간 파형 갱신을 멈춰 UI 부하를 줄인다.
+                self.live_curve.setData([])
+                self.live_wave_visible = False
+            self._sync_playback_cursor_line()
         if self.playback_stream is not None and not self._is_playback_running():
             self._stop_playback_stream()
             if self.playback_source_path is not None:
@@ -1555,18 +2468,21 @@ class MainWindow(QMainWindow):
 
         status = self.engine.last_stream_status
         if self.engine.is_running():
+            self._refresh_stream_toggle_button()
             if status:
                 self.stream_label.setText(self._t("status_running_flag", status=status))
             return
 
         # UI는 실행중인데 스트림이 꺼졌다면 예외/장치 오류로 판단하고 상태를 해제한다.
-        if not self.start_btn.isEnabled():
+        if self.stream_expected_running:
             self._stop_stream()
             if status:
                 self.stream_label.setText(
                     self._t("status_stopped_error", status=status)
                 )
                 QMessageBox.warning(self, self._t("dialog_stream_error"), status)
+        else:
+            self._refresh_stream_toggle_button()
 
     def _plot_recorded(self, audio: np.ndarray, samplerate: int) -> None:
         """녹음 데이터를 다운샘플링해 기록 파형 플롯에 그린다."""
@@ -1579,7 +2495,8 @@ class MainWindow(QMainWindow):
             return
 
         duration = len(audio) / float(samplerate)
-        step = max(1, audio.size // 20000)
+        # 매우 긴 녹음에서도 플로팅 부하를 줄이기 위해 표시 샘플 수 제한
+        step = max(1, audio.size // 12000)
         trimmed = audio[::step]
         times = np.arange(trimmed.size, dtype=np.float64) * (step / float(samplerate))
         self.recorded_curve.setData(times, trimmed)
