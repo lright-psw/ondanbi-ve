@@ -648,7 +648,7 @@ class MainWindow(QMainWindow):
         self.engine = AudioEngine()
         self.last_recording_path: Optional[Path] = None
         self.current_language = "ko"
-        self.current_theme = "light"
+        self.current_theme = self._detect_initial_theme()
         self.slider_title_labels: dict[str, QLabel] = {}
         self.preset_keys_in_order = ["custom", "stage", "karaoke", "clean_boost"]
         self.process_end_mode = "auto"
@@ -666,18 +666,25 @@ class MainWindow(QMainWindow):
         self.stream_button_running_state: Optional[bool] = None
         self.playback_button_signature: Optional[Tuple[bool, bool, bool, str]] = None
         self.stream_expected_running = False
+        self.last_system_theme = self.current_theme
 
         self._build_ui()
         self._apply_theme()
         self._apply_language()
         self._load_devices()
         self._sync_all_params()
+        self._connect_system_theme_sync()
 
         self.wave_timer = QTimer(self)
         # 파형 갱신 빈도를 약간 낮춰 UI 부하와 GIL 경합을 줄인다.
         self.wave_timer.setInterval(80)
         self.wave_timer.timeout.connect(self._update_live_waveform)
         self.wave_timer.start()
+
+        self.system_theme_timer = QTimer(self)
+        self.system_theme_timer.setInterval(2000)
+        self.system_theme_timer.timeout.connect(self._poll_system_theme)
+        self.system_theme_timer.start()
 
     # -------- 언어/모드 상태 처리 --------
     def _t(self, key: str, **kwargs) -> str:
@@ -690,6 +697,39 @@ class MainWindow(QMainWindow):
             return text.format(**kwargs)
         return text
 
+    def _detect_initial_theme(self) -> str:
+        """앱 시작 시 시스템 테마를 감지해 초기 테마(light/dark)를 반환."""
+        # 1) Qt 스타일 힌트 우선 사용 (지원 시 OS 테마를 직접 반영)
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                hints = app.styleHints()
+                if hasattr(hints, "colorScheme"):
+                    color_scheme = hints.colorScheme()
+                    if color_scheme == Qt.ColorScheme.Dark:
+                        return "dark"
+                    if color_scheme == Qt.ColorScheme.Light:
+                        return "light"
+        except Exception:
+            pass
+
+        # 2) Windows 레지스트리 fallback (AppsUseLightTheme: 0=dark, 1=light)
+        if sys.platform == "win32":
+            try:
+                import winreg
+
+                key_path = (
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+                )
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                    value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                    return "light" if int(value) == 1 else "dark"
+            except Exception:
+                pass
+
+        # 3) 감지 실패 시 안전 기본값
+        return "light"
+
     def _on_language_changed(self) -> None:
         """언어 콤보 박스 변경 이벤트를 처리해 UI 문구를 갱신"""
         lang = self.language_combo.currentData()
@@ -701,6 +741,37 @@ class MainWindow(QMainWindow):
         """달/태양 버튼 클릭 시 다크/라이트 테마를 전환."""
         self.current_theme = "dark" if self.current_theme == "light" else "light"
         self._apply_theme()
+
+    def _connect_system_theme_sync(self) -> None:
+        """OS 테마 변경 시그널이 있으면 연결해 즉시 반영한다."""
+        try:
+            app = QApplication.instance()
+            if app is None:
+                return
+            hints = app.styleHints()
+            signal = getattr(hints, "colorSchemeChanged", None)
+            if signal is not None:
+                signal.connect(self._on_system_theme_changed)
+        except Exception:
+            pass
+
+    def _on_system_theme_changed(self, *_args) -> None:
+        """Qt 시그널로 전달된 OS 테마 변경을 즉시 반영."""
+        self._sync_theme_with_system(force=True)
+
+    def _poll_system_theme(self) -> None:
+        """시그널 미지원/누락 환경을 대비한 주기적 OS 테마 동기화."""
+        self._sync_theme_with_system(force=False)
+
+    def _sync_theme_with_system(self, force: bool = False) -> None:
+        """현재 OS 테마와 앱 테마를 동기화한다."""
+        detected_theme = self._detect_initial_theme()
+        if (not force) and detected_theme == self.last_system_theme:
+            return
+        self.last_system_theme = detected_theme
+        if self.current_theme != detected_theme:
+            self.current_theme = detected_theme
+            self._apply_theme()
 
     @staticmethod
     def _create_theme_icon(kind: str) -> QIcon:
@@ -2508,6 +2579,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         """창 종료 시 오디오 스트림과 재생을 정리"""
         try:
+            if hasattr(self, "system_theme_timer"):
+                self.system_theme_timer.stop()
+            if hasattr(self, "wave_timer"):
+                self.wave_timer.stop()
             self._stop_playback_stream(clear_audio=True)
             self.engine.stop()
             sd.stop()
