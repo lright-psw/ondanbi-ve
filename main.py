@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -65,21 +66,38 @@ class AudioEngine:
         self.params = EffectParams()
         self.stream: Optional[sd.Stream] = None
         self.sample_rate = 48000
-        # UI 이벤트가 많은 상황에서도 끊김을 줄이기 위해 버퍼를 조금 크게 둔다.
-        self.block_size = 2048
+        # 기본값은 저지연과 안정성을 함께 고려한 균형 설정.
+        self.block_size = 256
         self.input_channels = 1
         self.output_channels = 1
         self.input_device: Optional[int] = None
         self.output_device: Optional[int] = None
+        self.stream_profile = "default"
 
         self.latest_output = np.zeros(self.block_size, dtype=np.float32)
         self.last_stream_status = ""
+        self.last_stream_status_at = 0.0
 
         self.is_recording = False
         self.recorded_chunks: List[np.ndarray] = []
+        self.recorded_mic_chunks: List[np.ndarray] = []
+        self.recorded_karaoke_chunks: List[np.ndarray] = []
+        self.recording_alignment_frames = 0
+        self.recording_sync_offset_ms = 110
         # 기본값: 녹음 중에는 스피커로 내보내지 않고 파일에만 저장.
         self.record_output_mode = "mute_while_recording"
         self.active_record_output_mode = self.record_output_mode
+
+        # 카라오케(MR) 소스/재생 상태
+        self.karaoke_source_audio: Optional[np.ndarray] = None
+        self.karaoke_source_sr = 0
+        self.karaoke_audio: Optional[np.ndarray] = None
+        self.karaoke_position = 0
+        self.karaoke_playing = False
+        self.karaoke_gain = 1.0
+        self.karaoke_finished = False
+        self.karaoke_sync_frames = 0
+        self.input_latency_frames = 0
 
         self.reverb_tap_seconds = (0.013, 0.017, 0.019, 0.023)
         self.reverb_tap_gains = np.array([0.45, 0.33, 0.24, 0.18], dtype=np.float32)
@@ -138,6 +156,219 @@ class AudioEngine:
                 # 미녹음 상태에서는 다음 녹음 세션 모드도 즉시 동기화한다.
                 self.active_record_output_mode = mode
 
+    # -------- 카라오케 트랙 --------
+    @staticmethod
+    def _resample_audio(data: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+        """샘플레이트가 다를 때 선형 보간으로 오디오를 리샘플링"""
+        if src_sr <= 0 or dst_sr <= 0 or src_sr == dst_sr:
+            return data.astype(np.float32, copy=False)
+        if data.shape[0] == 0:
+            return np.zeros((0, data.shape[1]), dtype=np.float32)
+
+        target_frames = max(1, int(round(data.shape[0] * (dst_sr / float(src_sr)))))
+        if target_frames == data.shape[0]:
+            return data.astype(np.float32, copy=False)
+
+        src_x = np.linspace(0.0, 1.0, num=data.shape[0], endpoint=False, dtype=np.float64)
+        dst_x = np.linspace(
+            0.0, 1.0, num=target_frames, endpoint=False, dtype=np.float64
+        )
+        resampled = np.empty((target_frames, data.shape[1]), dtype=np.float32)
+        for ch in range(data.shape[1]):
+            resampled[:, ch] = np.interp(dst_x, src_x, data[:, ch]).astype(np.float32)
+        return resampled
+
+    def _update_karaoke_sync_frames(self, stream_latency: Any = None) -> None:
+        """입력 경로 지연을 기준으로 MR 싱크 보정 프레임 수를 갱신"""
+        input_latency_s = 0.0
+        try:
+            if isinstance(stream_latency, (tuple, list)) and len(stream_latency) >= 1:
+                input_latency_s = float(stream_latency[0])
+            elif isinstance(stream_latency, (int, float)):
+                # 단일 값만 있으면 입력/출력 합으로 간주하고 절반만 사용
+                input_latency_s = float(stream_latency) * 0.5
+        except Exception:
+            input_latency_s = 0.0
+
+        if input_latency_s <= 0.0 and self.input_device is not None:
+            try:
+                in_dev = sd.query_devices(self.input_device)
+                input_latency_s = float(in_dev.get("default_low_input_latency") or 0.0)
+            except Exception:
+                input_latency_s = 0.0
+
+        if self.sample_rate <= 0:
+            self.karaoke_sync_frames = 0
+            self.input_latency_frames = 0
+            return
+
+        input_frames = int(round(max(0.0, input_latency_s) * float(self.sample_rate)))
+        self.input_latency_frames = int(
+            np.clip(input_frames, 0, int(0.25 * float(self.sample_rate)))
+        )
+        sync_frames = int(self.input_latency_frames)
+        # 콜백 1블록 정도를 추가 보정해 체감 싱크를 맞춘다.
+        sync_frames += int(self.block_size)
+        self.karaoke_sync_frames = int(
+            np.clip(sync_frames, 0, int(0.35 * float(self.sample_rate)))
+        )
+
+    def _prepare_karaoke_audio_locked(self, keep_progress: bool = True) -> None:
+        """현재 스트림(sample rate / output channels)에 맞춰 MR 버퍼를 준비"""
+        if (
+            self.karaoke_source_audio is None
+            or self.karaoke_source_sr <= 0
+            or self.output_channels <= 0
+        ):
+            self.karaoke_audio = None
+            self.karaoke_position = 0
+            self.karaoke_playing = False
+            self.karaoke_finished = False
+            return
+
+        source = self.karaoke_source_audio
+        previous_progress = 0.0
+        sync_frames = int(max(0, self.karaoke_sync_frames))
+        if (
+            keep_progress
+            and self.karaoke_audio is not None
+            and self.karaoke_audio.shape[0] > 0
+        ):
+            effective_prev = int(
+                np.clip(
+                    self.karaoke_position - sync_frames,
+                    0,
+                    self.karaoke_audio.shape[0],
+                )
+            )
+            previous_progress = effective_prev / float(self.karaoke_audio.shape[0])
+
+        prepared = self._resample_audio(source, self.karaoke_source_sr, self.sample_rate)
+        if prepared.ndim == 1:
+            prepared = prepared[:, np.newaxis]
+
+        if self.output_channels == 1:
+            if prepared.shape[1] > 1:
+                prepared = np.mean(prepared, axis=1, keepdims=True).astype(np.float32)
+            else:
+                prepared = prepared[:, :1]
+        else:
+            if prepared.shape[1] == 1:
+                prepared = np.repeat(prepared, self.output_channels, axis=1)
+            elif prepared.shape[1] > self.output_channels:
+                prepared = prepared[:, : self.output_channels]
+            elif prepared.shape[1] < self.output_channels:
+                repeat_count = self.output_channels - prepared.shape[1]
+                pad = np.repeat(prepared[:, -1:], repeat_count, axis=1)
+                prepared = np.concatenate((prepared, pad), axis=1)
+
+        prepared = np.ascontiguousarray(prepared.astype(np.float32, copy=False))
+        self.karaoke_audio = prepared
+
+        if prepared.shape[0] <= 0:
+            self.karaoke_position = 0
+            self.karaoke_playing = False
+            self.karaoke_finished = False
+            return
+
+        if keep_progress and previous_progress > 0.0:
+            effective_now = int(
+                np.clip(round(previous_progress * prepared.shape[0]), 0, prepared.shape[0])
+            )
+            if self.karaoke_position > sync_frames:
+                self.karaoke_position = effective_now + sync_frames
+            else:
+                self.karaoke_position = effective_now
+        else:
+            self.karaoke_position = 0
+        timeline_total = prepared.shape[0] + sync_frames
+        if self.karaoke_position >= timeline_total:
+            self.karaoke_position = 0
+        self.karaoke_finished = False
+
+    def set_karaoke_source(self, audio: np.ndarray, samplerate: int) -> None:
+        """MR 오디오 소스를 설정하고 스트림 조건에 맞는 버퍼를 준비"""
+        if audio.ndim == 1:
+            audio = audio[:, np.newaxis]
+        if audio.ndim != 2:
+            raise RuntimeError("Invalid karaoke audio format.")
+        normalized = np.ascontiguousarray(audio.astype(np.float32, copy=False))
+        with self.lock:
+            self.karaoke_source_audio = normalized
+            self.karaoke_source_sr = int(samplerate)
+            self.karaoke_playing = False
+            self.karaoke_position = 0
+            self.karaoke_finished = False
+            self._prepare_karaoke_audio_locked(keep_progress=False)
+
+    def clear_karaoke_source(self) -> None:
+        """MR 소스와 재생 상태를 모두 초기화"""
+        with self.lock:
+            self.karaoke_source_audio = None
+            self.karaoke_source_sr = 0
+            self.karaoke_audio = None
+            self.karaoke_position = 0
+            self.karaoke_playing = False
+            self.karaoke_finished = False
+
+    def set_karaoke_gain(self, gain: float) -> None:
+        """MR 트랙 출력 볼륨 배율(0.0~2.0)을 설정"""
+        with self.lock:
+            self.karaoke_gain = float(np.clip(gain, 0.0, 2.0))
+
+    def set_recording_sync_offset_ms(self, offset_ms: int) -> None:
+        """녹음 파일 싱크 보정을 위한 수동 오프셋(ms)을 설정"""
+        with self.lock:
+            self.recording_sync_offset_ms = int(np.clip(offset_ms, -500, 500))
+
+    def play_karaoke(self, restart: bool = False) -> bool:
+        """MR 재생 시작(또는 재개). 준비된 트랙이 없으면 False"""
+        with self.lock:
+            if self.karaoke_audio is None or self.karaoke_audio.shape[0] <= 0:
+                return False
+            timeline_total = self.karaoke_audio.shape[0] + int(
+                max(0, self.karaoke_sync_frames)
+            )
+            if restart or self.karaoke_position >= timeline_total:
+                self.karaoke_position = 0
+            self.karaoke_playing = True
+            self.karaoke_finished = False
+            return True
+
+    def pause_karaoke(self) -> None:
+        """MR 재생을 일시정지"""
+        with self.lock:
+            self.karaoke_playing = False
+
+    def stop_karaoke(self) -> None:
+        """MR 재생을 정지하고 위치를 처음으로 되돌림"""
+        with self.lock:
+            self.karaoke_playing = False
+            self.karaoke_position = 0
+            self.karaoke_finished = False
+
+    def is_karaoke_playing(self) -> bool:
+        """MR 재생 중 여부를 반환"""
+        with self.lock:
+            return bool(self.karaoke_playing)
+
+    def get_karaoke_status(self) -> Tuple[bool, float, float, bool]:
+        """(준비됨, 현재초, 전체초, 종료됨) 상태를 반환"""
+        with self.lock:
+            prepared = self.karaoke_audio is not None and self.karaoke_audio.shape[0] > 0
+            if not prepared or self.sample_rate <= 0:
+                return False, 0.0, 0.0, bool(self.karaoke_finished)
+            total = self.karaoke_audio.shape[0] / float(self.sample_rate)
+            effective_frame = int(
+                np.clip(
+                    self.karaoke_position - int(max(0, self.karaoke_sync_frames)),
+                    0,
+                    self.karaoke_audio.shape[0],
+                )
+            )
+            current = effective_frame / float(self.sample_rate)
+            return True, current, total, bool(self.karaoke_finished)
+
     # -------- 스트림 시작/중지 --------
     def _find_compatible_stream_config(self) -> Tuple[int, int]:
         """선택한 장치에서 동작 가능한 샘플레이트/출력 채널 조합을 탐색"""
@@ -182,6 +413,57 @@ class AudioEngine:
 
         raise RuntimeError("No compatible stream configuration found for devices.")
 
+    def _build_wasapi_exclusive_settings(self) -> Optional[Tuple[Any, Any]]:
+        """Windows WASAPI Exclusive 모드 사용 가능 시 extra_settings를 생성"""
+        if (
+            sys.platform != "win32"
+            or not hasattr(sd, "WasapiSettings")
+            or self.input_device is None
+            or self.output_device is None
+        ):
+            return None
+
+        try:
+            in_dev = sd.query_devices(self.input_device)
+            out_dev = sd.query_devices(self.output_device)
+            in_api_name = str(sd.query_hostapis(int(in_dev["hostapi"]))["name"]).upper()
+            out_api_name = str(
+                sd.query_hostapis(int(out_dev["hostapi"]))["name"]
+            ).upper()
+            if "WASAPI" not in in_api_name or "WASAPI" not in out_api_name:
+                return None
+            return (sd.WasapiSettings(exclusive=True), sd.WasapiSettings(exclusive=True))
+        except Exception:
+            return None
+
+    def _get_low_latency_hint(self) -> Tuple[float, float]:
+        """장치 low latency 값을 바탕으로 요청 지연 힌트를 계산"""
+        if self.input_device is None or self.output_device is None:
+            return (0.01, 0.01)
+
+        try:
+            in_dev = sd.query_devices(self.input_device)
+            out_dev = sd.query_devices(self.output_device)
+            in_low = float(in_dev.get("default_low_input_latency") or 0.0)
+            out_low = float(out_dev.get("default_low_output_latency") or 0.0)
+        except Exception:
+            return (0.01, 0.01)
+
+        # 과도한 초저지연값은 노이즈/언더런을 유발할 수 있어 완만하게 제한한다.
+        in_latency = min(max(in_low if in_low > 0 else 0.01, 0.006), 0.02)
+        out_latency = min(max(out_low if out_low > 0 else 0.01, 0.006), 0.02)
+        return (in_latency, out_latency)
+
+    @staticmethod
+    def _normalize_stream_status(status: sd.CallbackFlags) -> str:
+        """콜백 상태 문자열에서 정보성 플래그를 제거해 UI용으로 정규화."""
+        text = str(status).strip()
+        if not text:
+            return ""
+        parts = [part.strip() for part in text.split(",") if part.strip()]
+        filtered = [part for part in parts if part.lower() != "priming output"]
+        return ", ".join(filtered)
+
     def start(self) -> int:
         """오디오 스트림을 시작하고 실제 동작 샘플레이트를 반환"""
         with self.lock:
@@ -193,18 +475,89 @@ class AudioEngine:
         self.sample_rate, self.output_channels = self._find_compatible_stream_config()
         self._reset_effect_buffers()
         self.last_stream_status = ""
+        self.last_stream_status_at = 0.0
+        self.latest_output = np.zeros(self.block_size, dtype=np.float32)
+        with self.lock:
+            self._prepare_karaoke_audio_locked(keep_progress=True)
 
-        # 입력/출력 장치를 동시에 여는 full-duplex 스트림.
-        self.stream = sd.Stream(
-            device=(self.input_device, self.output_device),
-            channels=(self.input_channels, self.output_channels),
-            samplerate=self.sample_rate,
-            blocksize=self.block_size,
-            latency="high",
-            dtype="float32",
-            callback=self._audio_callback,
+        # 저지연 우선으로 시도하고, 장치가 지원하지 않으면 점진적으로 완화한다.
+        latency_hint = self._get_low_latency_hint()
+        wasapi_exclusive = self._build_wasapi_exclusive_settings()
+        stream_attempts: List[Tuple[int, Any, Optional[Tuple[Any, Any]], str]] = []
+
+        # 기본은 공유 모드의 안정 프로파일을 우선 사용한다.
+        stream_attempts.extend(
+            [
+                (256, "low", None, "shared-low"),
+                (128, "low", None, "shared-low"),
+                (256, latency_hint, None, "shared-balanced"),
+                (512, "low", None, "shared-fallback"),
+                (1024, "high", None, "safe-fallback"),
+            ]
         )
-        self.stream.start()
+        # 장치가 잘 받는 경우에만 Exclusive를 마지막 후보로 시도한다.
+        if wasapi_exclusive is not None:
+            stream_attempts.extend(
+                [
+                    (256, "low", wasapi_exclusive, "wasapi-exclusive"),
+                ]
+            )
+        errors: List[str] = []
+        opened_stream: Optional[sd.Stream] = None
+        selected_block_size = self.block_size
+        selected_profile = self.stream_profile
+
+        for (
+            candidate_block_size,
+            candidate_latency,
+            candidate_extra_settings,
+            candidate_profile,
+        ) in stream_attempts:
+            try:
+                stream_kwargs: Dict[str, Any] = {
+                    "device": (self.input_device, self.output_device),
+                    "channels": (self.input_channels, self.output_channels),
+                    "samplerate": self.sample_rate,
+                    "blocksize": candidate_block_size,
+                    "latency": candidate_latency,
+                    "dtype": "float32",
+                    "clip_off": True,
+                    "dither_off": True,
+                    "prime_output_buffers_using_stream_callback": True,
+                    "callback": self._audio_callback,
+                }
+                if candidate_extra_settings is not None:
+                    stream_kwargs["extra_settings"] = candidate_extra_settings
+
+                opened_stream = sd.Stream(**stream_kwargs)
+                opened_stream.start()
+                if not opened_stream.active:
+                    raise RuntimeError("stream did not become active")
+                selected_block_size = candidate_block_size
+                selected_profile = candidate_profile
+                break
+            except Exception as exc:
+                errors.append(
+                    "block="
+                    f"{candidate_block_size}, latency={candidate_latency}, "
+                    f"profile={candidate_profile}: {exc}"
+                )
+                if opened_stream is not None:
+                    try:
+                        opened_stream.close()
+                    except Exception:
+                        pass
+                    opened_stream = None
+
+        if opened_stream is None:
+            error_text = "; ".join(errors) if errors else "unknown error"
+            raise RuntimeError(f"Failed to open audio stream ({error_text})")
+
+        self.block_size = selected_block_size
+        self.stream_profile = selected_profile
+        self._update_karaoke_sync_frames(getattr(opened_stream, "latency", None))
+        self.latest_output = np.zeros(self.block_size, dtype=np.float32)
+        self.stream = opened_stream
         return self.sample_rate
 
     def stop(self) -> None:
@@ -214,7 +567,15 @@ class AudioEngine:
             self.stream = None
             self.is_recording = False
             self.recorded_chunks = []
+            self.recorded_mic_chunks = []
+            self.recorded_karaoke_chunks = []
+            self.recording_alignment_frames = 0
             self.active_record_output_mode = self.record_output_mode
+            self.karaoke_playing = False
+            self.karaoke_position = 0
+            self.karaoke_finished = False
+            self.last_stream_status = ""
+            self.last_stream_status_at = 0.0
 
         if stream is not None:
             stream.stop()
@@ -245,8 +606,37 @@ class AudioEngine:
             params = copy.copy(self.params)
             recording_enabled = self.is_recording
             record_output_mode = self.active_record_output_mode
-        if status:
-            self.last_stream_status = str(status)
+            karaoke_gain = float(self.karaoke_gain)
+            karaoke_chunk: Optional[np.ndarray] = None
+            if (
+                self.karaoke_playing
+                and self.karaoke_audio is not None
+                and self.karaoke_audio.shape[0] > 0
+            ):
+                total = self.karaoke_audio.shape[0]
+                delay = int(max(0, self.karaoke_sync_frames))
+                timeline_total = total + delay
+                start = int(np.clip(self.karaoke_position, 0, timeline_total))
+                end = min(start + frames, timeline_total)
+                karaoke_chunk = np.zeros(
+                    (frames, self.karaoke_audio.shape[1]), dtype=np.float32
+                )
+                src_start = start - delay
+                src_end = end - delay
+                valid_start = max(src_start, 0)
+                valid_end = min(src_end, total)
+                if valid_end > valid_start:
+                    dst_offset = valid_start - src_start
+                    length = valid_end - valid_start
+                    karaoke_chunk[dst_offset : dst_offset + length] = self.karaoke_audio[
+                        valid_start:valid_end
+                    ]
+                self.karaoke_position = end
+                if end >= timeline_total:
+                    self.karaoke_playing = False
+                    self.karaoke_finished = True
+        status_text = self._normalize_stream_status(status)
+        status_now = time.monotonic()
 
         if indata.size == 0:
             mono = np.zeros(frames, dtype=np.float32)
@@ -254,28 +644,57 @@ class AudioEngine:
             mono = indata[:, 0].astype(np.float32, copy=True)
 
         processed = self._process_block(mono, params)
-        # 녹음 중 무음 모드에서는 출력만 끄고, 녹음 데이터는 저장
+        mic_mix = np.zeros((frames, outdata.shape[1]), dtype=np.float32)
+        mic_mix[:, 0] = processed
+        if outdata.shape[1] > 1:
+            mic_mix[:, 1:] = processed[:, np.newaxis]
+
+        karaoke_mix = np.zeros((frames, outdata.shape[1]), dtype=np.float32)
+        mixed_for_output = np.array(mic_mix, copy=True)
+        if outdata.shape[1] > 1:
+            mixed_for_output[:, 1:] = processed[:, np.newaxis]
+        if karaoke_chunk is not None and karaoke_chunk.size > 0:
+            rows = karaoke_chunk.shape[0]
+            cols = min(karaoke_chunk.shape[1], karaoke_mix.shape[1])
+            karaoke_mix[:rows, :cols] += karaoke_chunk[:, :cols] * karaoke_gain
+            if cols == 1 and karaoke_mix.shape[1] > 1:
+                karaoke_mix[:rows, 1:] += karaoke_chunk[:, :1] * karaoke_gain
+            mixed_for_output[:rows, :cols] += karaoke_chunk[:, :cols] * karaoke_gain
+            if cols == 1 and mixed_for_output.shape[1] > 1:
+                mixed_for_output[:rows, 1:] += karaoke_chunk[:, :1] * karaoke_gain
+        np.clip(karaoke_mix, -1.0, 1.0, out=karaoke_mix)
+        np.clip(mixed_for_output, -1.0, 1.0, out=mixed_for_output)
+
+        # 녹음 중 무음 모드에서는 마이크 모니터링만 끄고 MR은 계속 출력.
         mute_output = recording_enabled and record_output_mode == "mute_while_recording"
-        if mute_output:
-            outdata.fill(0.0)
-        else:
-            outdata[:, 0] = processed
-            if outdata.shape[1] > 1:
-                outdata[:, 1:] = processed[:, np.newaxis]
+        outdata[:] = karaoke_mix if mute_output else mixed_for_output
 
         with self.lock:
+            if status_text:
+                self.last_stream_status = status_text
+                self.last_stream_status_at = status_now
+            elif (
+                self.last_stream_status
+                and (status_now - float(self.last_stream_status_at)) >= 1.5
+            ):
+                # 경고가 더 이상 없으면 상태 표시는 자동으로 정리한다.
+                self.last_stream_status = ""
             self.latest_output = processed
             if recording_enabled:
-                self.recorded_chunks.append(processed.copy())
+                # 녹음에는 마이크 이펙트 + MR이 합쳐진 최종 출력 신호를 저장한다.
+                self.recorded_chunks.append(mixed_for_output.copy())
+                self.recorded_mic_chunks.append(mic_mix.copy())
+                self.recorded_karaoke_chunks.append(karaoke_mix.copy())
 
     def _process_block(self, samples: np.ndarray, params: EffectParams) -> np.ndarray:
         """한 블록의 오디오 샘플에 이펙트 체인을 순서대로 적용"""
-        x = samples.astype(np.float32, copy=True)
+        x = np.array(samples, dtype=np.float32, copy=True)
         if params.input_gain != 1.0:
-            x *= params.input_gain
+            np.multiply(x, params.input_gain, out=x)
 
         if params.distortion_drive > 1.001:
-            x = np.tanh(x * params.distortion_drive).astype(np.float32)
+            np.multiply(x, params.distortion_drive, out=x)
+            np.tanh(x, out=x)
 
         if params.reverb_wet > 0.001:
             x = self._apply_reverb(x, params.reverb_wet)
@@ -291,7 +710,7 @@ class AudioEngine:
             )
 
         if params.output_gain != 1.0:
-            x *= params.output_gain
+            np.multiply(x, params.output_gain, out=x)
 
         # 최종 출력은 [-1.0, 1.0] 범위로 제한해 클리핑 왜곡을 방지한다.
         np.clip(x, -1.0, 1.0, out=x)
@@ -300,58 +719,64 @@ class AudioEngine:
     def _apply_reverb(self, samples: np.ndarray, wet: float) -> np.ndarray:
         """짧은 멀티탭 버퍼를 이용해 간단한 리버브 효과를 적용"""
         wet = float(np.clip(wet, 0.0, 1.0))
-        output = np.empty_like(samples)
         feedback = 0.35
+        dry_mix = 1.0 - wet
+        max_samples = self.max_reverb_samples
 
-        for i, dry in enumerate(samples):
+        for i in range(samples.size):
+            dry = float(samples[i])
             reverb_sum = 0.0
             for tap, gain in zip(self.reverb_taps, self.reverb_tap_gains):
-                read_idx = (self.reverb_idx - tap) % self.max_reverb_samples
-                reverb_sum += self.reverb_buffer[read_idx] * gain
+                read_idx = (self.reverb_idx - tap) % max_samples
+                reverb_sum += float(self.reverb_buffer[read_idx]) * float(gain)
 
             self.reverb_buffer[self.reverb_idx] = dry + (reverb_sum * feedback)
-            self.reverb_idx = (self.reverb_idx + 1) % self.max_reverb_samples
-            output[i] = (dry * (1.0 - wet)) + (reverb_sum * wet)
+            self.reverb_idx = (self.reverb_idx + 1) % max_samples
+            samples[i] = (dry * dry_mix) + (reverb_sum * wet)
 
-        return output
+        return samples
 
     def _apply_delay(
         self, samples: np.ndarray, wet: float, delay_ms: float, feedback: float
     ) -> np.ndarray:
         """딜레이 시간/피드백 파라미터 기반의 딜레이 효과를 적용"""
         wet = float(np.clip(wet, 0.0, 1.0))
+        dry_mix = 1.0 - wet
         feedback = float(np.clip(feedback, 0.0, 0.95))
         delay_samples = int(delay_ms * self.sample_rate / 1000.0)
         delay_samples = max(1, min(delay_samples, self.max_delay_samples - 1))
-        output = np.empty_like(samples)
+        max_samples = self.max_delay_samples
 
-        for i, dry in enumerate(samples):
-            read_idx = (self.delay_idx - delay_samples) % self.max_delay_samples
-            delayed = self.delay_buffer[read_idx]
-            output[i] = (dry * (1.0 - wet)) + (delayed * wet)
+        for i in range(samples.size):
+            dry = float(samples[i])
+            read_idx = (self.delay_idx - delay_samples) % max_samples
+            delayed = float(self.delay_buffer[read_idx])
+            samples[i] = (dry * dry_mix) + (delayed * wet)
             self.delay_buffer[self.delay_idx] = dry + (delayed * feedback)
-            self.delay_idx = (self.delay_idx + 1) % self.max_delay_samples
+            self.delay_idx = (self.delay_idx + 1) % max_samples
 
-        return output
+        return samples
 
     def _apply_echo(
         self, samples: np.ndarray, wet: float, echo_ms: float, feedback: float
     ) -> np.ndarray:
         """긴 지연 기반의 에코 효과를 적용"""
         wet = float(np.clip(wet, 0.0, 1.0))
+        dry_mix = 1.0 - wet
         feedback = float(np.clip(feedback, 0.0, 0.95))
         echo_samples = int(echo_ms * self.sample_rate / 1000.0)
         echo_samples = max(1, min(echo_samples, self.max_echo_samples - 1))
-        output = np.empty_like(samples)
+        max_samples = self.max_echo_samples
 
-        for i, dry in enumerate(samples):
-            read_idx = (self.echo_idx - echo_samples) % self.max_echo_samples
-            echoed = self.echo_buffer[read_idx]
-            output[i] = (dry * (1.0 - wet)) + (echoed * wet)
+        for i in range(samples.size):
+            dry = float(samples[i])
+            read_idx = (self.echo_idx - echo_samples) % max_samples
+            echoed = float(self.echo_buffer[read_idx])
+            samples[i] = (dry * dry_mix) + (echoed * wet)
             self.echo_buffer[self.echo_idx] = dry + (echoed * feedback)
-            self.echo_idx = (self.echo_idx + 1) % self.max_echo_samples
+            self.echo_idx = (self.echo_idx + 1) % max_samples
 
-        return output
+        return samples
 
     # -------- 녹음 데이터 접근 --------
     def get_latest_output(self) -> np.ndarray:
@@ -367,6 +792,12 @@ class AudioEngine:
             # 녹음 시작 시점의 모드를 현재 녹음 세션에 고정한다.
             self.active_record_output_mode = self.record_output_mode
             self.recorded_chunks = []
+            self.recorded_mic_chunks = []
+            self.recorded_karaoke_chunks = []
+            manual_frames = int(
+                round((self.recording_sync_offset_ms / 1000.0) * float(self.sample_rate))
+            )
+            self.recording_alignment_frames = int(self.input_latency_frames + manual_frames)
             self.is_recording = True
 
     def stop_recording(self) -> Tuple[np.ndarray, int]:
@@ -376,10 +807,56 @@ class AudioEngine:
             self.active_record_output_mode = self.record_output_mode
             chunks = self.recorded_chunks
             self.recorded_chunks = []
+            mic_chunks = self.recorded_mic_chunks
+            karaoke_chunks = self.recorded_karaoke_chunks
+            self.recorded_mic_chunks = []
+            self.recorded_karaoke_chunks = []
+            align_frames = int(max(0, self.recording_alignment_frames))
+            self.recording_alignment_frames = 0
             rate = self.sample_rate
 
         if not chunks:
             return np.array([], dtype=np.float32), rate
+
+        # 녹음 파일에서는 자동 지연 + 수동 보정(ms)을 반영해 MR/보컬 싱크를 정렬한다.
+        if (
+            mic_chunks
+            and karaoke_chunks
+            and len(mic_chunks) == len(karaoke_chunks)
+        ):
+            mic = np.concatenate(mic_chunks, axis=0).astype(np.float32, copy=False)
+            karaoke = np.concatenate(karaoke_chunks, axis=0).astype(np.float32, copy=False)
+            if not np.any(np.abs(karaoke) > 1e-7):
+                return np.concatenate(chunks).astype(np.float32), rate
+            if mic.ndim == 1:
+                mic = mic[:, np.newaxis]
+            if karaoke.ndim == 1:
+                karaoke = karaoke[:, np.newaxis]
+            channels = max(mic.shape[1], karaoke.shape[1])
+            if mic.shape[1] < channels:
+                mic = np.repeat(mic[:, :1], channels, axis=1)
+            if karaoke.shape[1] < channels:
+                karaoke = np.repeat(karaoke[:, :1], channels, axis=1)
+
+            if align_frames >= 0:
+                mic_start = 0
+                karaoke_start = align_frames
+            else:
+                mic_start = -align_frames
+                karaoke_start = 0
+
+            total = max(
+                mic_start + mic.shape[0],
+                karaoke_start + karaoke.shape[0],
+            )
+            mixed = np.zeros((total, channels), dtype=np.float32)
+            mixed[mic_start : mic_start + mic.shape[0], : mic.shape[1]] += mic
+            mixed[
+                karaoke_start : karaoke_start + karaoke.shape[0], : karaoke.shape[1]
+            ] += karaoke
+            np.clip(mixed, -1.0, 1.0, out=mixed)
+            return mixed, rate
+
         return np.concatenate(chunks).astype(np.float32), rate
 
 
@@ -397,8 +874,10 @@ class MainWindow(QMainWindow):
             "group_effects_gain": "이펙트 및 게인",
             "group_waveforms": "파형",
             "group_recording": "녹음",
+            "group_karaoke": "노래방",
             "tab_effects": "이펙트",
             "tab_studio": "스튜디오",
+            "tab_karaoke": "노래방",
             "tab_waveforms": "파형 보기",
             "tab_recording": "녹음/재생",
             "label_input_mic": "입력 마이크",
@@ -406,6 +885,15 @@ class MainWindow(QMainWindow):
             "label_language": "언어",
             "label_theme": "테마",
             "label_process_end_mode": "처리 종료 모드",
+            "tooltip_help": "사용법 보기",
+            "dialog_help_title": "온단비 VE 스튜디오 사용법",
+            "msg_help_content": (
+                "1) 오디오 장치에서 입력/출력을 선택하고 [처리 시작]을 누르세요.\n"
+                "2) 이펙트 탭에서 게인/리버브/딜레이 등을 원하는 만큼 조절하세요.\n"
+                "3) 스튜디오 탭에서 [시작]-[정지]로 녹음하고 바로 재생해 확인하세요.\n"
+                "4) 노래방 탭에서 MR/노래 파일을 불러와 [재생]/[정지]로 연습하세요.\n"
+                "5) 싱크가 어긋나면 [녹음 싱크 보정] 값을 먼저 110ms 근처에서 조절하세요."
+            ),
             "theme_light": "라이트 모드",
             "theme_dark": "다크 모드",
             "device_unassigned": "장치 미할당",
@@ -418,6 +906,10 @@ class MainWindow(QMainWindow):
             "status_running_sr": "{samplerate} Hz 실행 중",
             "status_running_flag": "실행 중 ({status})",
             "status_stopped_error": "오류로 중지됨 ({status})",
+            "stream_status_output_underflow": "출력 버퍼 지연",
+            "stream_status_input_underflow": "입력 버퍼 지연",
+            "stream_status_output_overflow": "출력 버퍼 과부하",
+            "stream_status_input_overflow": "입력 버퍼 과부하",
             "slider_input_gain": "입력 게인",
             "slider_output_gain": "출력 게인",
             "slider_distortion_drive": "디스토션 드라이브",
@@ -472,8 +964,9 @@ class MainWindow(QMainWindow):
             "dialog_stream_error": "오디오 스트림 오류",
             "status_playback_done": "재생 완료: {path}",
             "status_playback_position": "{current:.2f}초 / {total:.2f}초",
-            "msg_m4a_dep_missing": "M4A 처리를 위해 `imageio-ffmpeg` 패키지가 필요합니다.",
+            "msg_m4a_dep_missing": "M4A/MP3 등 일부 포맷 처리를 위해 `imageio-ffmpeg` 패키지가 필요합니다.",
             "msg_m4a_convert_failed": "M4A 변환/로딩에 실패했습니다: {reason}",
+            "msg_audio_decode_failed": "오디오 파일 로딩에 실패했습니다: {reason}",
             "group_presets_settings": "프리셋 및 설정",
             "label_preset": "기본 프리셋",
             "btn_apply_preset": "프리셋 적용",
@@ -492,6 +985,22 @@ class MainWindow(QMainWindow):
             "status_settings_saved": "세팅 저장 완료: {path}",
             "status_settings_loaded": "세팅 불러오기 완료: {path}",
             "status_settings_reset": "기본값으로 초기화했습니다.",
+            "label_karaoke_track": "MR/노래 파일",
+            "btn_karaoke_browse": "파일 불러오기",
+            "label_karaoke_gain": "MR 볼륨",
+            "label_record_sync_offset": "녹음 싱크 보정",
+            "btn_karaoke_play": "재생",
+            "btn_karaoke_pause": "일시정지",
+            "btn_karaoke_stop": "정지",
+            "status_karaoke_idle": "노래방 트랙이 선택되지 않았습니다.",
+            "status_karaoke_loaded": "트랙 로드됨: {path} ({duration:.2f}초)",
+            "status_karaoke_playing": "노래방 재생 중: {current:.2f}초 / {total:.2f}초",
+            "status_karaoke_paused": "노래방 일시정지: {current:.2f}초 / {total:.2f}초",
+            "status_karaoke_stopped": "노래방 정지(0초): {path}",
+            "status_karaoke_finished": "노래방 재생 완료: {path}",
+            "dialog_karaoke_file_error": "노래방 파일 오류",
+            "msg_karaoke_select_file": "먼저 MR/노래 파일을 불러오세요.",
+            "filter_audio_load": "오디오 파일 (*.wav *.mp3 *.m4a *.flac *.ogg *.opus *.aac *.wma);;모든 파일 (*.*)",
         },
         "en": {
             "window_title": "Ondanbi VE Studio",
@@ -499,8 +1008,10 @@ class MainWindow(QMainWindow):
             "group_effects_gain": "Effects and Gain",
             "group_waveforms": "Waveforms",
             "group_recording": "Recording",
+            "group_karaoke": "Karaoke",
             "tab_effects": "Effects",
             "tab_studio": "Studio",
+            "tab_karaoke": "Karaoke",
             "tab_waveforms": "Waveforms",
             "tab_recording": "Record/Playback",
             "label_input_mic": "Input Mic",
@@ -508,6 +1019,15 @@ class MainWindow(QMainWindow):
             "label_language": "Language",
             "label_theme": "Theme",
             "label_process_end_mode": "Process End Mode",
+            "tooltip_help": "Open quick guide",
+            "dialog_help_title": "Ondanbi VE Studio Guide",
+            "msg_help_content": (
+                "1) Select input/output devices, then click [Start Processing].\n"
+                "2) Adjust gain, reverb, delay, and other effects in the Effects tab.\n"
+                "3) In Studio tab, record with [Start]/[Stop] and play back immediately.\n"
+                "4) In Karaoke tab, load an MR/song track and control with [Play]/[Stop].\n"
+                "5) If recorded vocal timing is off, tune [Record Sync Offset] near 110ms."
+            ),
             "theme_light": "Light Mode",
             "theme_dark": "Dark Mode",
             "device_unassigned": "Unassigned",
@@ -520,6 +1040,10 @@ class MainWindow(QMainWindow):
             "status_running_sr": "Running @ {samplerate} Hz",
             "status_running_flag": "Running ({status})",
             "status_stopped_error": "Stopped by error ({status})",
+            "stream_status_output_underflow": "Output underflow",
+            "stream_status_input_underflow": "Input underflow",
+            "stream_status_output_overflow": "Output overflow",
+            "stream_status_input_overflow": "Input overflow",
             "slider_input_gain": "Input Gain",
             "slider_output_gain": "Output Gain",
             "slider_distortion_drive": "Distortion Drive",
@@ -574,8 +1098,9 @@ class MainWindow(QMainWindow):
             "dialog_stream_error": "Audio Stream Error",
             "status_playback_done": "Playback finished: {path}",
             "status_playback_position": "{current:.2f}s / {total:.2f}s",
-            "msg_m4a_dep_missing": "`imageio-ffmpeg` is required for M4A support.",
+            "msg_m4a_dep_missing": "`imageio-ffmpeg` is required for M4A/MP3 and some additional formats.",
             "msg_m4a_convert_failed": "M4A conversion/loading failed: {reason}",
+            "msg_audio_decode_failed": "Failed to load audio file: {reason}",
             "group_presets_settings": "Presets and Settings",
             "label_preset": "Built-in Presets",
             "btn_apply_preset": "Apply Preset",
@@ -594,6 +1119,22 @@ class MainWindow(QMainWindow):
             "status_settings_saved": "Settings saved: {path}",
             "status_settings_loaded": "Settings loaded: {path}",
             "status_settings_reset": "Reset to defaults.",
+            "label_karaoke_track": "MR/Song File",
+            "btn_karaoke_browse": "Load File",
+            "label_karaoke_gain": "MR Volume",
+            "label_record_sync_offset": "Record Sync Offset",
+            "btn_karaoke_play": "Play",
+            "btn_karaoke_pause": "Pause",
+            "btn_karaoke_stop": "Stop",
+            "status_karaoke_idle": "No karaoke track selected.",
+            "status_karaoke_loaded": "Track loaded: {path} ({duration:.2f}s)",
+            "status_karaoke_playing": "Karaoke playing: {current:.2f}s / {total:.2f}s",
+            "status_karaoke_paused": "Karaoke paused: {current:.2f}s / {total:.2f}s",
+            "status_karaoke_stopped": "Karaoke stopped (0s): {path}",
+            "status_karaoke_finished": "Karaoke finished: {path}",
+            "dialog_karaoke_file_error": "Karaoke File Error",
+            "msg_karaoke_select_file": "Load an MR/song file first.",
+            "filter_audio_load": "Audio files (*.wav *.mp3 *.m4a *.flac *.ogg *.opus *.aac *.wma);;All files (*.*)",
         },
     }
 
@@ -661,6 +1202,8 @@ class MainWindow(QMainWindow):
         self.playback_output_device: Optional[int] = None
         self.playback_lock = threading.Lock()
         self.playback_cursor_internal_update = False
+        self.karaoke_track_path: Optional[Path] = None
+        self.karaoke_ui_signature: Optional[Tuple[str, float, float, bool, bool, str]] = None
         self.live_wave_visible = False
         self.last_cursor_frame_synced = -1
         self.stream_button_running_state: Optional[bool] = None
@@ -696,6 +1239,28 @@ class MainWindow(QMainWindow):
         if kwargs:
             return text.format(**kwargs)
         return text
+
+    def _format_stream_status_for_ui(self, raw_status: str) -> str:
+        """오디오 상태 플래그를 현재 언어의 짧은 설명으로 변환."""
+        status_text = raw_status.strip()
+        if not status_text:
+            return ""
+        lower = status_text.lower()
+        mapping = (
+            ("output underflow", "stream_status_output_underflow"),
+            ("input underflow", "stream_status_input_underflow"),
+            ("output overflow", "stream_status_output_overflow"),
+            ("input overflow", "stream_status_input_overflow"),
+        )
+        labels: List[str] = []
+        for token, key in mapping:
+            if token in lower:
+                labels.append(self._t(key))
+        if labels:
+            # 동일 플래그 중복 표시는 제거한다.
+            unique_labels = list(dict.fromkeys(labels))
+            return ", ".join(unique_labels)
+        return status_text
 
     def _detect_initial_theme(self) -> str:
         """앱 시작 시 시스템 테마를 감지해 초기 테마(light/dark)를 반환."""
@@ -741,6 +1306,14 @@ class MainWindow(QMainWindow):
         """달/태양 버튼 클릭 시 다크/라이트 테마를 전환."""
         self.current_theme = "dark" if self.current_theme == "light" else "light"
         self._apply_theme()
+
+    def _show_help_dialog(self) -> None:
+        """상단 도움말 버튼 클릭 시 간단 사용법 팝업을 표시."""
+        QMessageBox.information(
+            self,
+            self._t("dialog_help_title"),
+            self._t("msg_help_content"),
+        )
 
     def _connect_system_theme_sync(self) -> None:
         """OS 테마 변경 시그널이 있으면 연결해 즉시 반영한다."""
@@ -850,6 +1423,201 @@ class MainWindow(QMainWindow):
         return "mute_while_recording"
 
     @staticmethod
+    def _format_seconds_text(seconds: float) -> str:
+        """초 단위를 mm:ss 형식 문자열로 변환"""
+        seconds = max(0.0, float(seconds))
+        total = int(round(seconds))
+        minutes = total // 60
+        remain = total % 60
+        return f"{minutes:02d}:{remain:02d}"
+
+    def _on_karaoke_gain_changed(self, value: int) -> None:
+        """노래방 MR 볼륨 슬라이더 값을 엔진에 반영"""
+        gain = float(value) / 100.0
+        self.engine.set_karaoke_gain(gain)
+        if not self.karaoke_gain_value.hasFocus():
+            self.karaoke_gain_value.setText(f"{value}%")
+        self._refresh_karaoke_controls(force=True)
+
+    def _on_record_sync_offset_changed(self, value: int) -> None:
+        """녹음 파일 싱크 보정(ms) 값을 엔진에 반영"""
+        self.engine.set_recording_sync_offset_ms(int(value))
+        if not self.record_sync_offset_value.hasFocus():
+            self.record_sync_offset_value.setText(f"{int(value):+d} ms")
+
+    def _apply_karaoke_gain_input(self) -> None:
+        """MR 볼륨 입력 필드 텍스트를 슬라이더 값으로 반영"""
+        parsed = self._parse_slider_input_value(
+            text=self.karaoke_gain_value.text(),
+            current_value=self.karaoke_gain_slider.value(),
+            slider=self.karaoke_gain_slider,
+        )
+        self.karaoke_gain_slider.setValue(parsed)
+        self.karaoke_gain_value.setText(f"{self.karaoke_gain_slider.value()}%")
+
+    def _apply_record_sync_offset_input(self) -> None:
+        """녹음 싱크 보정 입력 필드 텍스트를 슬라이더 값으로 반영"""
+        parsed = self._parse_slider_input_value(
+            text=self.record_sync_offset_value.text(),
+            current_value=self.record_sync_offset_slider.value(),
+            slider=self.record_sync_offset_slider,
+        )
+        self.record_sync_offset_slider.setValue(parsed)
+        self.record_sync_offset_value.setText(
+            f"{int(self.record_sync_offset_slider.value()):+d} ms"
+        )
+
+    def _load_karaoke_track(self, source_path: Path) -> None:
+        """선택한 MR/노래 파일을 로드해 엔진 카라오케 소스로 등록"""
+        resolved = source_path.expanduser().resolve()
+        data, samplerate = self._load_audio_file(resolved)
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
+        self.engine.set_karaoke_source(data, int(samplerate))
+        self.karaoke_track_path = resolved
+        self.karaoke_path_edit.setText(str(resolved))
+        duration = (
+            data.shape[0] / float(samplerate) if samplerate and data.shape[0] > 0 else 0.0
+        )
+        self.karaoke_status.setText(
+            self._t("status_karaoke_loaded", path=resolved, duration=duration)
+        )
+        self._refresh_karaoke_controls(force=True)
+
+    def _browse_karaoke_file(self) -> None:
+        """노래방 탭에서 MR/노래 파일을 선택해 로드"""
+        current = self.karaoke_path_edit.text().strip() or str(Path.cwd())
+        target, _ = QFileDialog.getOpenFileName(
+            self, self._t("btn_karaoke_browse"), current, self._t("filter_audio_load")
+        )
+        if not target:
+            return
+        try:
+            self._load_karaoke_track(Path(target))
+        except Exception as exc:
+            QMessageBox.critical(self, self._t("dialog_karaoke_file_error"), str(exc))
+
+    def _toggle_karaoke_playback(self) -> None:
+        """노래방 재생/일시정지 토글"""
+        path_text = self.karaoke_path_edit.text().strip()
+        if not path_text:
+            QMessageBox.information(
+                self, self._t("dialog_karaoke_file_error"), self._t("msg_karaoke_select_file")
+            )
+            return
+
+        if self.karaoke_track_path is None:
+            candidate = Path(path_text).expanduser()
+            if not candidate.exists():
+                QMessageBox.information(
+                    self,
+                    self._t("dialog_karaoke_file_error"),
+                    self._t("msg_karaoke_select_file"),
+                )
+                return
+            try:
+                self._load_karaoke_track(candidate)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, self._t("dialog_karaoke_file_error"), str(exc)
+                )
+                return
+
+        if not self.engine.is_running():
+            self._start_stream()
+            if not self.engine.is_running():
+                return
+
+        self._stop_playback_stream()
+        if self.engine.is_karaoke_playing():
+            self.engine.pause_karaoke()
+        else:
+            if not self.engine.play_karaoke():
+                QMessageBox.information(
+                    self,
+                    self._t("dialog_karaoke_file_error"),
+                    self._t("msg_karaoke_select_file"),
+                )
+                return
+        self._refresh_karaoke_controls(force=True)
+
+    def _stop_karaoke_playback(self) -> None:
+        """노래방 재생을 정지하고 재생 위치를 0초로 되돌림"""
+        self.engine.stop_karaoke()
+        if self.karaoke_track_path is not None:
+            self.karaoke_status.setText(
+                self._t("status_karaoke_stopped", path=self.karaoke_track_path)
+            )
+        else:
+            self.karaoke_status.setText(self._t("status_karaoke_idle"))
+        self._refresh_karaoke_controls(force=True)
+
+    def _refresh_karaoke_controls(self, force: bool = False) -> None:
+        """노래방 탭 버튼 상태/문구와 상태 라벨을 현재 엔진 상태로 동기화"""
+        prepared, current, total, finished = self.engine.get_karaoke_status()
+        playing = self.engine.is_karaoke_playing()
+        signature = (
+            "ready" if prepared else "empty",
+            round(current, 2),
+            round(total, 2),
+            bool(playing),
+            bool(finished),
+            self.current_language,
+        )
+        if (not force) and self.karaoke_ui_signature == signature:
+            return
+        self.karaoke_ui_signature = signature
+        if not self.karaoke_gain_value.hasFocus():
+            self.karaoke_gain_value.setText(f"{int(self.karaoke_gain_slider.value())}%")
+        if not self.record_sync_offset_value.hasFocus():
+            self.record_sync_offset_value.setText(
+                f"{int(self.record_sync_offset_slider.value()):+d} ms"
+            )
+
+        self._set_icon_button(
+            self.karaoke_stop_btn,
+            QStyle.StandardPixmap.SP_MediaStop,
+            self._t("btn_karaoke_stop"),
+        )
+        self.karaoke_play_btn.setEnabled(prepared)
+        self.karaoke_stop_btn.setEnabled(prepared and (playing or current > 0.0))
+
+        if playing:
+            self._set_icon_button(
+                self.karaoke_play_btn,
+                QStyle.StandardPixmap.SP_MediaPause,
+                self._t("btn_karaoke_pause"),
+            )
+            self.karaoke_status.setText(
+                self._t("status_karaoke_playing", current=current, total=total)
+            )
+        else:
+            self._set_icon_button(
+                self.karaoke_play_btn,
+                QStyle.StandardPixmap.SP_MediaPlay,
+                self._t("btn_karaoke_play"),
+            )
+            if prepared and finished and self.karaoke_track_path is not None:
+                self.karaoke_status.setText(
+                    self._t("status_karaoke_finished", path=self.karaoke_track_path)
+                )
+            elif prepared:
+                if current <= 0.0001 and self.karaoke_track_path is not None:
+                    self.karaoke_status.setText(
+                        self._t(
+                            "status_karaoke_loaded",
+                            path=self.karaoke_track_path,
+                            duration=total,
+                        )
+                    )
+                else:
+                    self.karaoke_status.setText(
+                        self._t("status_karaoke_paused", current=current, total=total)
+                    )
+            else:
+                self.karaoke_status.setText(self._t("status_karaoke_idle"))
+
+    @staticmethod
     def _settings_default_path() -> Path:
         """세팅 JSON의 기본 저장 경로를 반환."""
         return Path.cwd() / "voice_settings.json"
@@ -923,6 +1691,9 @@ class MainWindow(QMainWindow):
             ),
             "record_output_mode": self._get_selected_record_output_mode(),
             "record_save_path": self.path_edit.text().strip(),
+            "karaoke_track_path": self.karaoke_path_edit.text().strip(),
+            "karaoke_gain": int(self.karaoke_gain_slider.value()),
+            "record_sync_offset_ms": int(self.record_sync_offset_slider.value()),
             "preset_key": str(self.preset_combo.currentData() or "custom"),
             "sliders": self._capture_slider_settings(),
         }
@@ -963,6 +1734,31 @@ class MainWindow(QMainWindow):
         save_path = payload.get("record_save_path")
         if isinstance(save_path, str) and save_path.strip():
             self.path_edit.setText(save_path.strip())
+
+        karaoke_gain = payload.get("karaoke_gain")
+        if karaoke_gain is not None:
+            self.karaoke_gain_slider.setValue(
+                self._clamp_slider_value(self.karaoke_gain_slider, karaoke_gain)
+            )
+
+        record_sync_offset = payload.get("record_sync_offset_ms")
+        if record_sync_offset is not None:
+            self.record_sync_offset_slider.setValue(
+                self._clamp_slider_value(
+                    self.record_sync_offset_slider, record_sync_offset
+                )
+            )
+
+        karaoke_track = payload.get("karaoke_track_path")
+        if isinstance(karaoke_track, str) and karaoke_track.strip():
+            self.karaoke_path_edit.setText(karaoke_track.strip())
+            karaoke_path = Path(karaoke_track.strip()).expanduser()
+            if karaoke_path.exists():
+                try:
+                    self._load_karaoke_track(karaoke_path)
+                except Exception:
+                    # 세팅 로드 중 파일 파싱 실패는 치명적이지 않게 무시한다.
+                    pass
 
         preset_key = payload.get("preset_key")
         if isinstance(preset_key, str):
@@ -1094,6 +1890,13 @@ class MainWindow(QMainWindow):
         ):
             button.setMinimumWidth(116)
             button.setMaximumWidth(116)
+            button.setMinimumHeight(34)
+
+    def _set_karaoke_button_sizes(self) -> None:
+        """노래방 재생 컨트롤 버튼 크기를 동일하게 고정."""
+        for button in (self.karaoke_play_btn, self.karaoke_stop_btn):
+            button.setMinimumWidth(128)
+            button.setMaximumWidth(128)
             button.setMinimumHeight(34)
 
     def _refresh_stream_toggle_button(self, force: bool = False) -> None:
@@ -1249,6 +2052,25 @@ class MainWindow(QMainWindow):
             QPushButton#themeToggle:pressed {{
                 background: {colors["card_border"]};
             }}
+            QPushButton#helpButton {{
+                background: {colors["input_bg"]};
+                color: {colors["text"]};
+                border: 1px solid {colors["input_border"]};
+                border-radius: 8px;
+                min-width: 34px;
+                max-width: 34px;
+                min-height: 34px;
+                max-height: 34px;
+                padding: 0px;
+                font-size: 13pt;
+                font-weight: 700;
+            }}
+            QPushButton#helpButton:hover {{
+                background: {colors["tab_hover"]};
+            }}
+            QPushButton#helpButton:pressed {{
+                background: {colors["card_border"]};
+            }}
             QLineEdit, QComboBox {{
                 background: {colors["input_bg"]};
                 color: {colors["text"]};
@@ -1362,6 +2184,18 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(root)
         root_layout.setSpacing(12)
         root_layout.setContentsMargins(14, 14, 14, 14)
+
+        # 최상단 우측 빠른 도움말 버튼
+        self.help_btn = QPushButton("?")
+        self.help_btn.setObjectName("helpButton")
+        self.help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.help_btn.setFixedSize(34, 34)
+        self.help_btn.clicked.connect(self._show_help_dialog)
+        utility_row = QHBoxLayout()
+        utility_row.setContentsMargins(0, 0, 0, 0)
+        utility_row.addStretch(1)
+        utility_row.addWidget(self.help_btn, 0, Qt.AlignmentFlag.AlignRight)
+        root_layout.addLayout(utility_row)
 
         # 1) 장치/언어/처리 시작-중지 영역
         self.device_group = QGroupBox()
@@ -1692,6 +2526,125 @@ class MainWindow(QMainWindow):
         studio_layout.addWidget(self.plot_group, 3)
         self.main_tabs.addTab(self.studio_tab, "")
 
+        # 5) 노래방 탭 (MR 파일 + 마이크 이펙트 동시 출력)
+        self.karaoke_tab = QWidget()
+        karaoke_tab_layout = QVBoxLayout(self.karaoke_tab)
+        karaoke_tab_layout.setContentsMargins(8, 8, 8, 8)
+        karaoke_tab_layout.setSpacing(10)
+
+        self.karaoke_group = QGroupBox()
+        karaoke_layout = QGridLayout(self.karaoke_group)
+        karaoke_layout.setHorizontalSpacing(10)
+        karaoke_layout.setVerticalSpacing(8)
+
+        self.karaoke_path_label = QLabel()
+        self.karaoke_path_edit = QLineEdit()
+        self.karaoke_path_edit.setReadOnly(True)
+        self.karaoke_path_edit.setMinimumWidth(380)
+        self.karaoke_path_edit.setMaximumWidth(430)
+        self.karaoke_browse_btn = QPushButton()
+        self.karaoke_browse_btn.clicked.connect(self._browse_karaoke_file)
+        # 우측 컨트롤 폭을 통일해 정렬감을 유지한다.
+        self.karaoke_browse_btn.setMinimumWidth(104)
+        self.karaoke_browse_btn.setMaximumWidth(104)
+        self.karaoke_browse_btn.setMinimumHeight(32)
+
+        self.karaoke_gain_label = QLabel()
+        self.karaoke_gain_slider = QSlider(Qt.Orientation.Horizontal)
+        self.karaoke_gain_slider.setRange(0, 200)
+        self.karaoke_gain_slider.setValue(100)
+        self.karaoke_gain_slider.setMinimumWidth(260)
+        self.karaoke_gain_slider.setMaximumWidth(430)
+        self.karaoke_gain_slider.valueChanged.connect(self._on_karaoke_gain_changed)
+        self.karaoke_gain_value = QLineEdit("100%")
+        self.karaoke_gain_value.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.karaoke_gain_value.setMinimumWidth(88)
+        self.karaoke_gain_value.setMaximumWidth(104)
+        self.karaoke_gain_value.editingFinished.connect(self._apply_karaoke_gain_input)
+
+        self.record_sync_offset_label = QLabel()
+        self.record_sync_offset_slider = QSlider(Qt.Orientation.Horizontal)
+        self.record_sync_offset_slider.setRange(-300, 300)
+        self.record_sync_offset_slider.setValue(110)
+        self.record_sync_offset_slider.setMinimumWidth(260)
+        self.record_sync_offset_slider.setMaximumWidth(430)
+        self.record_sync_offset_slider.valueChanged.connect(
+            self._on_record_sync_offset_changed
+        )
+        self.record_sync_offset_value = QLineEdit("+110 ms")
+        self.record_sync_offset_value.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.record_sync_offset_value.setMinimumWidth(88)
+        self.record_sync_offset_value.setMaximumWidth(104)
+        self.record_sync_offset_value.editingFinished.connect(
+            self._apply_record_sync_offset_input
+        )
+
+        self.karaoke_play_btn = QPushButton()
+        self.karaoke_play_btn.clicked.connect(self._toggle_karaoke_playback)
+        self.karaoke_stop_btn = QPushButton()
+        self.karaoke_stop_btn.clicked.connect(self._stop_karaoke_playback)
+        self.karaoke_stop_btn.setEnabled(False)
+        self._set_karaoke_button_sizes()
+
+        self.karaoke_status = QLabel()
+        self.karaoke_status.setObjectName("statusPill")
+        self.karaoke_status.setMaximumWidth(660)
+        self.karaoke_status.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+
+        # 노래방 컨트롤 블록을 중앙으로 모으기 위한 6열 레이아웃
+        # 0: 라벨 / 1: 좌 여백 / 2: 메인 컨트롤 / 3: 간격 / 4: 우측 컨트롤 / 5: 우 여백
+        karaoke_layout.addWidget(self.karaoke_path_label, 0, 0)
+        karaoke_layout.addWidget(
+            self.karaoke_path_edit, 0, 2, 1, 1, Qt.AlignmentFlag.AlignHCenter
+        )
+        karaoke_layout.addWidget(
+            self.karaoke_browse_btn, 0, 4, 1, 1, Qt.AlignmentFlag.AlignHCenter
+        )
+        karaoke_layout.addWidget(self.karaoke_gain_label, 1, 0)
+        karaoke_layout.addWidget(
+            self.karaoke_gain_slider, 1, 2, 1, 1, Qt.AlignmentFlag.AlignHCenter
+        )
+        karaoke_layout.addWidget(
+            self.karaoke_gain_value, 1, 4, 1, 1, Qt.AlignmentFlag.AlignHCenter
+        )
+        karaoke_layout.addWidget(self.record_sync_offset_label, 2, 0)
+        karaoke_layout.addWidget(
+            self.record_sync_offset_slider, 2, 2, 1, 1, Qt.AlignmentFlag.AlignHCenter
+        )
+        karaoke_layout.addWidget(
+            self.record_sync_offset_value, 2, 4, 1, 1, Qt.AlignmentFlag.AlignHCenter
+        )
+
+        karaoke_action_row = QHBoxLayout()
+        karaoke_action_row.setContentsMargins(0, 0, 0, 0)
+        karaoke_action_row.setSpacing(10)
+        karaoke_action_row.addStretch(1)
+        karaoke_action_row.addWidget(self.karaoke_play_btn)
+        karaoke_action_row.addWidget(self.karaoke_stop_btn)
+        karaoke_action_row.addStretch(1)
+        karaoke_layout.addLayout(karaoke_action_row, 3, 2, 1, 3)
+
+        karaoke_layout.addWidget(
+            self.karaoke_status, 4, 1, 1, 4, Qt.AlignmentFlag.AlignRight
+        )
+
+        karaoke_layout.setColumnMinimumWidth(0, 130)
+        karaoke_layout.setColumnMinimumWidth(3, 14)
+        karaoke_layout.setColumnStretch(1, 2)
+        karaoke_layout.setColumnStretch(2, 0)
+        karaoke_layout.setColumnStretch(4, 0)
+        karaoke_layout.setColumnStretch(5, 3)
+
+        karaoke_tab_layout.addWidget(self.karaoke_group)
+        karaoke_tab_layout.addStretch(1)
+        self.main_tabs.addTab(self.karaoke_tab, "")
+
         root_layout.addWidget(self.main_tabs, 1)
 
         self.setCentralWidget(root)
@@ -1699,13 +2652,18 @@ class MainWindow(QMainWindow):
     def _apply_language(self) -> None:
         """현재 언어 기준으로 버튼, 라벨, 플롯 타이틀을 일괄 갱신"""
         self.setWindowTitle(self._t("window_title"))
+        self.help_btn.setText("?")
+        self.help_btn.setToolTip(self._t("tooltip_help"))
+        self.help_btn.setStatusTip(self._t("tooltip_help"))
         self.device_group.setTitle(self._t("group_audio_devices"))
         self.presets_group.setTitle(self._t("group_presets_settings"))
         self.effects_group.setTitle(self._t("group_effects_gain"))
         self.plot_group.setTitle(self._t("group_waveforms"))
         self.rec_group.setTitle(self._t("group_recording"))
+        self.karaoke_group.setTitle(self._t("group_karaoke"))
         self.main_tabs.setTabText(0, self._t("tab_effects"))
         self.main_tabs.setTabText(1, self._t("tab_studio"))
+        self.main_tabs.setTabText(2, self._t("tab_karaoke"))
 
         self.input_label.setText(self._t("label_input_mic"))
         self.output_label.setText(self._t("label_output_speaker"))
@@ -1759,6 +2717,18 @@ class MainWindow(QMainWindow):
         self.routing_hint.setText(self._t("hint_virtual_routing"))
         self._refresh_device_unassigned_label()
 
+        self.karaoke_path_label.setText(self._t("label_karaoke_track"))
+        self.karaoke_browse_btn.setText(self._t("btn_karaoke_browse"))
+        self.karaoke_gain_label.setText(self._t("label_karaoke_gain"))
+        if not self.karaoke_gain_value.hasFocus():
+            self.karaoke_gain_value.setText(f"{int(self.karaoke_gain_slider.value())}%")
+        self.record_sync_offset_label.setText(self._t("label_record_sync_offset"))
+        if not self.record_sync_offset_value.hasFocus():
+            self.record_sync_offset_value.setText(
+                f"{int(self.record_sync_offset_slider.value()):+d} ms"
+            )
+        self._set_karaoke_button_sizes()
+
         for key, label in self.slider_title_labels.items():
             label.setText(self._t(key))
 
@@ -1768,7 +2738,7 @@ class MainWindow(QMainWindow):
             self.record_status.setText(self._t("status_no_recording"))
 
         if self.engine.is_running():
-            status = self.engine.last_stream_status
+            status = self._format_stream_status_for_ui(self.engine.last_stream_status)
             if status:
                 self.stream_label.setText(self._t("status_running_flag", status=status))
             else:
@@ -1779,6 +2749,7 @@ class MainWindow(QMainWindow):
             self.stream_label.setText(self._t("status_stopped"))
 
         self._refresh_playback_buttons(force=True)
+        self._refresh_karaoke_controls(force=True)
 
     def _add_slider(
         self,
@@ -1894,6 +2865,8 @@ class MainWindow(QMainWindow):
         self.engine.set_param(
             "echo_feedback", self.echo_feedback_slider.value() / 100.0
         )
+        self.engine.set_karaoke_gain(self.karaoke_gain_slider.value() / 100.0)
+        self.engine.set_recording_sync_offset_ms(int(self.record_sync_offset_slider.value()))
 
     def _load_devices(self) -> None:
         """입출력 장치 목록을 다시 조회하고 콤보 박스를 갱신"""
@@ -2012,12 +2985,9 @@ class MainWindow(QMainWindow):
                 str(source_path), dtype="float32", always_2d=True
             )
             return data, int(samplerate)
-        except Exception:
-            if source_path.suffix.lower() != ".m4a":
-                raise
-
+        except Exception as sf_exc:
             ffmpeg = self._get_ffmpeg_executable()
-            with tempfile.TemporaryDirectory(prefix="ve_m4a_decode_") as tmp_dir:
+            with tempfile.TemporaryDirectory(prefix="ve_audio_decode_") as tmp_dir:
                 decoded_wav = Path(tmp_dir) / "decoded.wav"
                 command = [
                     ffmpeg,
@@ -2037,10 +3007,11 @@ class MainWindow(QMainWindow):
                         str(decoded_wav), dtype="float32", always_2d=True
                     )
                     return data, int(samplerate)
-                except Exception as exc:
+                except Exception as ff_exc:
+                    reason = str(ff_exc).strip() or str(sf_exc).strip() or "unknown error"
                     raise RuntimeError(
-                        self._t("msg_m4a_convert_failed", reason=str(exc))
-                    ) from exc
+                        self._t("msg_audio_decode_failed", reason=reason)
+                    ) from ff_exc
 
     def _prepare_playback_audio_for_device(
         self, source_path: Path, output_device: int
@@ -2309,6 +3280,7 @@ class MainWindow(QMainWindow):
         self.stream_expected_running = True
         self._refresh_stream_toggle_button()
         self._refresh_playback_buttons()
+        self._refresh_karaoke_controls(force=True)
 
     def _stop_stream(self) -> None:
         """스트림을 중지하고 UI 상태를 대기 상태로 복귀시킨다."""
@@ -2322,6 +3294,7 @@ class MainWindow(QMainWindow):
         self.rec_start_btn.setEnabled(True)
         self.rec_stop_btn.setEnabled(False)
         self._refresh_playback_buttons()
+        self._refresh_karaoke_controls(force=True)
 
     def _browse_record_file(self) -> None:
         """사용자가 저장할 WAV 파일 경로를 직접 선택가능하게 한다."""
@@ -2537,11 +3510,12 @@ class MainWindow(QMainWindow):
                     self._t("status_playback_done", path=self.playback_source_path)
                 )
 
-        status = self.engine.last_stream_status
+        status = self._format_stream_status_for_ui(self.engine.last_stream_status)
         if self.engine.is_running():
             self._refresh_stream_toggle_button()
             if status:
                 self.stream_label.setText(self._t("status_running_flag", status=status))
+            self._refresh_karaoke_controls()
             return
 
         # UI는 실행중인데 스트림이 꺼졌다면 예외/장치 오류로 판단하고 상태를 해제한다.
@@ -2554,6 +3528,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, self._t("dialog_stream_error"), status)
         else:
             self._refresh_stream_toggle_button()
+        self._refresh_karaoke_controls()
 
     def _plot_recorded(self, audio: np.ndarray, samplerate: int) -> None:
         """녹음 데이터를 다운샘플링해 기록 파형 플롯에 그린다."""
